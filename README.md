@@ -37,33 +37,29 @@ An always-on-top, draggable mini player extension for Spotify using Chromium's D
 
 ## Setup & Installation
 
-### Option 1: Automatic Script (Windows)
-
-1. Open your terminal or file explorer in the repository directory:
-   ```cmd
-   cd C:\Users\Floyd\spicetify-miniplayer
-   ```
-2. Run `install.bat`.
-3. Launch Spotify. Toggle the player with `Alt + M` or the playbar icon.
-
-### Option 2: Manual Installation
-
 1. Copy `miniplayer.js` into your Spicetify Extensions directory:
-   ```powershell
-   Copy-Item "miniplayer.js" "$env:APPDATA\spicetify\Extensions\miniplayer.js"
-   ```
-2. Register and apply the extension:
-   ```cmd
+   - **PowerShell (Windows)**:
+     ```powershell
+     Copy-Item "miniplayer.js" "$env:APPDATA\spicetify\Extensions\miniplayer.js"
+     ```
+   - **Linux / macOS**:
+     ```bash
+     cp miniplayer.js ~/.config/spicetify/Extensions/
+     ```
+2. Enable the extension and apply:
+   ```bash
    spicetify config extensions miniplayer.js
    spicetify apply
    ```
+
+3. Toggle the player anytime in Spotify with `Alt + M` or by clicking the mini player icon in the playbar.
 
 ---
 
 ## Removal
 
-Run `uninstall.bat` or unregister via the command line:
-```cmd
+To disable and remove the extension:
+```bash
 spicetify config extensions miniplayer.js-
 spicetify apply
 ```
