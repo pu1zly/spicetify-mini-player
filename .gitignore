@@ -1,0 +1,12 @@
+# Build outputs
+**/bin/
+**/obj/
+**/publish/
+*.user
+
+# System / Editor files
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/
