@@ -17,6 +17,8 @@ An always-on-top, draggable mini player extension for Spotify using Chromium's D
     ![Compact Mode](assets/compact-mode.png)
 
   - **Mini Mode (360x48)**: Ultra-minimal single-line view combining track title and artist with marquee scrolling and controls.
+    
+    ![Mini Mode](assets/mini-mode.png)
 - **Next Up Integration**: Automatically pairs with `upcomingSong.js` to display upcoming queue items in a top bar.
 - **Smooth Playback**: Powered by `requestAnimationFrame` for timeline updates without unneeded DOM manipulation.
 - **Native Dragging**: Move the player anywhere on screen using header or empty card areas.
