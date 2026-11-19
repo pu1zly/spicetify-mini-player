@@ -42,6 +42,12 @@ An always-on-top, draggable mini player extension for Spotify using Chromium's D
      ```powershell
      Copy-Item "miniplayer.js" "$env:APPDATA\spicetify\Extensions\miniplayer.js"
      ```
+   - **File Explorer / Run Prompt (Windows)**:
+     Copy `miniplayer.js` directly to:
+     ```text
+     %appdata%\spicetify\Extensions\
+     ```
+     *(or `%userprofile%\.spicetify\Extensions\` depending on your Spicetify installation)*
    - **Linux / macOS**:
      ```bash
      cp miniplayer.js ~/.config/spicetify/Extensions/
