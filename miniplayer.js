@@ -12,62 +12,182 @@
     let pipWindow = null;
     let pipWindowFrameWidth = 0;
     let pipWindowFrameHeight = 0;
-    let updateInterval = null;
     let rafId = null;
     let isOpening = false;
-    let activePiPTimers = new Set();
+    let pipResources = null;
+    const playerState = {
+        currentTrack: null,
+        isPlaying: false,
+        progress: 0,
+        duration: 0,
+        volume: 1,
+        shuffle: false,
+        repeat: 0,
+        queue: []
+    };
+    const playerStateListeners = new Set();
+    const PLAYER_STATE_SYNC_MS = 1000;
+    const QUEUE_STATE_SYNC_MS = 1500;
+    const WINDOW_POSITION_SYNC_MS = 2500;
     let isUserSeeking = false;
     let isAdjustingVolume = false;
     let lastFormattedTime = "";
     let lastSliderValue = -1;
     let lastMarqueeKey = "";
-    let upcomingObserver = null;
+    // Experimental dynamic resizing state (see applyFluidLayout)
+    const fluid = { win: null, sig: "", prevSize: null };
     // Current layout mode ("standard" | "compact" | "mini") is set up below, after settings load
-    let topbarButton = null;
 
-    function cleanupPiPTimers() {
-        if (rafId) {
-            try { pipWindow?.cancelAnimationFrame(rafId); } catch (e) {}
-            try { cancelAnimationFrame(rafId); } catch (e) {}
-            rafId = null;
-        }
-        if (updateInterval) {
-            try { pipWindow?.clearInterval(updateInterval); } catch (e) {}
-            try { clearInterval(updateInterval); } catch (e) {}
-            updateInterval = null;
-        }
-        for (const id of activePiPTimers) {
-            try { pipWindow?.clearTimeout(id); } catch (e) {}
-            try { clearTimeout(id); } catch (e) {}
-        }
-        activePiPTimers.clear();
-        if (upcomingObserver) {
-            try { upcomingObserver.disconnect(); } catch (e) {}
-            upcomingObserver = null;
-        }
+    function isPiPWindowOpen() {
+        return !!pipWindow && !pipWindow.closed;
+    }
+
+    function createPiPResourceRegistry(win) {
+        let active = true;
+        const disposers = new Set();
+        const timeouts = new Map();
+        const intervals = new Map();
+        const frames = new Map();
+
+        const trackHandle = (map, id, cancel) => {
+            const dispose = () => {
+                if (!map.has(id)) return;
+                map.delete(id);
+                disposers.delete(dispose);
+                cancel(id);
+            };
+            map.set(id, dispose);
+            disposers.add(dispose);
+            return id;
+        };
+        const forgetHandle = (map, id) => {
+            const dispose = map.get(id);
+            if (!dispose) return;
+            map.delete(id);
+            disposers.delete(dispose);
+        };
+
+        return {
+            addCleanup(dispose) {
+                if (!active) {
+                    dispose();
+                    return () => {};
+                }
+                disposers.add(dispose);
+                return () => {
+                    if (!disposers.delete(dispose)) return;
+                    dispose();
+                };
+            },
+            listen(target, type, listener, options) {
+                target.addEventListener(type, listener, options);
+                const dispose = () => {
+                    target.removeEventListener(type, listener, options);
+                    disposers.delete(dispose);
+                };
+                disposers.add(dispose);
+                return dispose;
+            },
+            observe(observer, target, options) {
+                observer.observe(target, options);
+                const dispose = () => {
+                    observer.disconnect();
+                    disposers.delete(dispose);
+                };
+                disposers.add(dispose);
+                return observer;
+            },
+            setTimeout(fn, ms) {
+                const id = win.setTimeout(() => {
+                    forgetHandle(timeouts, id);
+                    if (active) fn();
+                }, ms);
+                return trackHandle(timeouts, id, handle => win.clearTimeout(handle));
+            },
+            clearTimeout(id) {
+                timeouts.get(id)?.();
+            },
+            delay(ms) {
+                return new Promise(resolve => {
+                    let id;
+                    let settled = false;
+                    const finish = (completed) => {
+                        if (settled) return;
+                        settled = true;
+                        forgetHandle(timeouts, id);
+                        resolve(completed);
+                    };
+                    id = win.setTimeout(() => finish(active), ms);
+                    const dispose = () => {
+                        if (!timeouts.has(id)) return;
+                        timeouts.delete(id);
+                        disposers.delete(dispose);
+                        win.clearTimeout(id);
+                        finish(false);
+                    };
+                    timeouts.set(id, dispose);
+                    disposers.add(dispose);
+                });
+            },
+            setInterval(fn, ms) {
+                const id = win.setInterval(() => {
+                    if (active) fn();
+                }, ms);
+                return trackHandle(intervals, id, handle => win.clearInterval(handle));
+            },
+            requestAnimationFrame(fn) {
+                const id = win.requestAnimationFrame(() => {
+                    forgetHandle(frames, id);
+                    if (active) fn();
+                });
+                return trackHandle(frames, id, handle => win.cancelAnimationFrame(handle));
+            },
+            cleanup() {
+                if (!active) return;
+                active = false;
+                for (const dispose of [...disposers]) {
+                    try {
+                        dispose();
+                    } catch (err) {
+                        console.warn("[MiniPlayer] Could not clean up a PiP resource:", err);
+                    }
+                }
+                disposers.clear();
+            }
+        };
+    }
+
+    function listenPiP(target, type, listener, options) {
+        if (!target || !pipResources) return;
+        return pipResources.listen(target, type, listener, options);
+    }
+
+    function cleanupPiPResources() {
+        const resources = pipResources;
+        pipResources = null;
+        resources?.cleanup();
+        rafId = null;
         isUserSeeking = false;
         isAdjustingVolume = false;
         lastUpcomingKey = null;
+        queueOpen = false;
+        lastQueueKey = null;
+        queueMenuEl = null;
+        queueMenuDisposers = [];
+        queueRenderDisposers = [];
         lastFormattedTime = "";
         lastSliderValue = -1;
         lastMarqueeKey = "";
     }
 
     function safeSetTimeout(fn, ms) {
-        if (!pipWindow || pipWindow.closed) return null;
-        const id = pipWindow.setTimeout(() => {
-            activePiPTimers.delete(id);
-            fn();
-        }, ms);
-        activePiPTimers.add(id);
-        return id;
+        if (!isPiPWindowOpen() || !pipResources) return null;
+        return pipResources.setTimeout(fn, ms);
     }
 
     function safeClearTimeout(id) {
-        if (id) {
-            activePiPTimers.delete(id);
-            try { pipWindow?.clearTimeout(id); } catch (e) {}
-            try { clearTimeout(id); } catch (e) {}
+        if (id !== null && id !== undefined) {
+            pipResources?.clearTimeout(id);
         }
     }
 
@@ -90,7 +210,8 @@
         seekStep: 5,             // seconds per scroll notch
         volumeStep: 5,           // percent per scroll notch
         clickToOpen: true,       // click title/artist to open album/artist page
-        showUpcoming: true,      // "Next up" bar (needs upcomingSong.js)
+        dynamicResize: false,    // experimental: free window resizing, the layout adapts to the size
+        showUpcoming: true,      // Show the next playback-queue item in the top bar
         modes: { standard: true, compact: true, mini: true }  // which modes you can switch between
     };
 
@@ -119,7 +240,7 @@
         s.idleDelay = clampNum(s.idleDelay, 200, 5000, DEFAULT_SETTINGS.idleDelay);
         s.seekStep = clampNum(s.seekStep, 1, 30, DEFAULT_SETTINGS.seekStep);
         s.volumeStep = clampNum(s.volumeStep, 1, 20, DEFAULT_SETTINGS.volumeStep);
-        ["autoFade", "rememberPosition", "scrollAdjust", "clickToOpen", "showUpcoming"].forEach(k => { s[k] = !!s[k]; });
+        ["autoFade", "rememberPosition", "scrollAdjust", "clickToOpen", "showUpcoming", "dynamicResize"].forEach(k => { s[k] = !!s[k]; });
         const savedModes = (saved && typeof saved.modes === "object" && saved.modes) || {};
         s.modes = {
             standard: savedModes.standard !== false,
@@ -145,6 +266,14 @@
     const MODE_LABELS = { standard: "Standard", compact: "Compact", mini: "Mini" };
     const MODE_KEY = "spicetify_miniplayer_mode";
 
+    function saveMode(mode) {
+        try {
+            localStorage.setItem(MODE_KEY, mode);
+        } catch (err) {
+            console.warn("[MiniPlayer] Could not save mode:", err);
+        }
+    }
+
     // Modes the user has left enabled in settings (always at least one)
     function enabledModes() {
         const list = MODES.filter(m => settings.modes[m]);
@@ -164,10 +293,15 @@
     }
 
     function loadMode() {
-        let m = localStorage.getItem(MODE_KEY);
-        if (!MODES.includes(m)) {
-            // Older versions only knew compact on/off
-            m = localStorage.getItem("spicetify_miniplayer_compact") === "true" ? "compact" : "standard";
+        let m;
+        try {
+            m = localStorage.getItem(MODE_KEY);
+            if (!MODES.includes(m)) {
+                // Older versions only knew compact on/off
+                m = localStorage.getItem("spicetify_miniplayer_compact") === "true" ? "compact" : "standard";
+            }
+        } catch (err) {
+            console.warn("[MiniPlayer] Could not load saved mode:", err);
         }
         const list = enabledModes();
         return list.includes(m) ? m : list[0];
@@ -175,10 +309,13 @@
 
     let currentMode = loadMode();
 
-    // "Next up" bar state (driven by the upcomingSong.js extension, if installed)
-    let upcomingBarEnabled = false;
+    // Top bar state: next-up text from the playback queue + the queue button/panel
     let lastUpcomingKey = null;
-
+    let queueOpen = false;
+    let lastQueueKey = null;
+    let queueMenuEl = null;
+    let queueMenuDisposers = [];
+    let queueRenderDisposers = [];
     // Fixed Dimensions: strictly locked to prevent expansion/stretching
     const STANDARD_WIDTH = 360;
     const STANDARD_HEIGHT = 185;
@@ -187,11 +324,21 @@
     // Mini mode: title + controls only
     const MINI_WIDTH = 360;
     const MINI_HEIGHT = 48;
-    // Extra strip above the card for the "Next up" bar (only added when upcomingSong.js is present)
+    // Top bar above the card: holds the queue button and optional next-track text
     const UPCOMING_BAR_HEIGHT = 26;
+    // Keep the queue window at 75% of its original 260px panel plus the 26px top bar.
+    const QUEUE_PANEL_HEIGHT = Math.round((260 + UPCOMING_BAR_HEIGHT) * 0.75) - UPCOMING_BAR_HEIGHT;
+    // Experimental dynamic resizing
+    const SIZE_KEY = "spicetify_miniplayer_size";
+    const FLUID_MIN_WIDTH = 240;
+    const FLUID_MIN_HEIGHT = 51;
+    const FLUID_QUEUE_MIN_HEIGHT = QUEUE_PANEL_HEIGHT + UPCOMING_BAR_HEIGHT; // window grows to this while the queue is open
+    const FLUID_ART_MIN_HEIGHT = 290; // card height above which the big album-art layout kicks in
 
     // SVG Icons
     const ICONS = {
+        more: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><circle cx="2.5" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13.5" cy="8" r="1.5"/></svg>`,
+        queue: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M15 15H1v-1.5h14V15zm0-4.5H1V9h14v1.5zm-14-7A2.5 2.5 0 0 1 3.5 1h9a2.5 2.5 0 0 1 0 5h-9A2.5 2.5 0 0 1 1 3.5zm2.5-1a1 1 0 0 0 0 2h9a1 1 0 1 0 0-2h-9z"/></svg>`,
         mini: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M1.5 5h13A1.5 1.5 0 0 1 16 6.5v3a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 9.5v-3A1.5 1.5 0 0 1 1.5 5zm0 1.5a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5V7a.5.5 0 0 0-.5-.5h-13z"/></svg>`,
         gear: `<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path fill-rule="evenodd" d="M8 3.8a4.2 4.2 0 1 0 0 8.4 4.2 4.2 0 0 0 0-8.4zM8 6.2a1.8 1.8 0 1 1 0 3.6 1.8 1.8 0 0 1 0-3.6z"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(45 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(90 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(135 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(180 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(225 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(270 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(315 8 8)"/></svg>`,
         miniplayer: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 21h10"/><rect width="20" height="14" x="2" y="3" rx="2"/></svg>`,
@@ -201,8 +348,6 @@
         next: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M12.7 1a.7.7 0 0 0-.7.7v5.15L2.05 1.106A.7.7 0 0 0 1 1.712v12.576a.7.7 0 0 0 1.05.607L12 9.149V14.3a.7.7 0 0 0 .7.7h1.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7h-1.6z"/></svg>`,
         shuffle: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.151.922a.75.75 0 1 0-1.06 1.06L13.109 3H11.16a3.75 3.75 0 0 0-2.873 1.34l-6.173 7.356A2.25 2.25 0 0 1 .39 12.5H0V14h.391a3.75 3.75 0 0 0 2.873-1.34l6.173-7.356a2.25 2.25 0 0 1 1.724-.804h1.947l-1.017 1.018a.75.75 0 0 0 1.06 1.06L15.98 3.75 13.15.922zM.391 3.5H0V2h.391c.9 0 1.745.405 2.308 1.077l1.724 2.056-.99.832L1.936 4.195A2.25 2.25 0 0 0 .39 3.5zm12.76 7.422a.75.75 0 0 1 1.06 1.06L11.39 14.805a.75.75 0 0 1-1.06-1.06l1.439-1.439h-1.61a3.75 3.75 0 0 1-2.872-1.34l-1.724-2.056.99-.832 1.498 1.787a2.25 2.25 0 0 0 1.724.805h1.948l-1.439-1.44z"/></svg>`,
         repeat: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 4.75A3.75 3.75 0 0 1 3.75 1h8.5A3.75 3.75 0 0 1 16 4.75v5a3.75 3.75 0 0 1-3.75 3.75H9.81l1.018 1.018a.75.75 0 1 1-1.06 1.06L6.939 12.75l2.829-2.828a.75.75 0 1 1 1.06 1.06L9.811 12h2.439a2.25 2.25 0 0 0 2.25-2.25v-5a2.25 2.25 0 0 0-2.25-2.25h-8.5A2.25 2.25 0 0 0 1.5 4.75v5A2.25 2.25 0 0 0 3.75 12H5v1.5H3.75A3.75 3.75 0 0 1 0 9.75v-5z"/></svg>`,
-        heartOutline: `<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="M1.69 2A4.582 4.582 0 0 1 8 2.023 4.583 4.583 0 0 1 11.88.817h.002a4.618 4.618 0 0 1 3.782 3.65 4.651 4.651 0 0 1-1.011 3.84L8 15.011l-6.65-6.702A4.65 4.65 0 0 1 .337 4.469 4.614 4.614 0 0 1 1.69 2zm1.062 1.06a3.118 3.118 0 0 0-.916 2.235c0 .828.333 1.62.923 2.215L8 12.784l5.24-5.275c.59-.594.923-1.386.923-2.214 0-.828-.332-1.62-.916-2.233a3.127 3.127 0 0 0-2.21-.914 3.12 3.12 0 0 0-2.215.92L8 4.02l-.822-.952a3.125 3.125 0 0 0-2.215-.92c-.83 0-1.623.332-2.211.913z"/></svg>`,
-        heartFilled: `<svg viewBox="0 0 16 16" width="16" height="16" fill="#1db954"><path d="M15.724 4.22A4.313 4.313 0 0 0 12.192.814a4.269 4.269 0 0 0-3.622 1.13.837.837 0 0 1-1.14 0 4.272 4.272 0 0 0-6.21 1.187A4.312 4.312 0 0 0 .416 6.786a4.368 4.368 0 0 0 1.067 2.973l6.064 6.136a.65.65 0 0 0 .918 0l6.07-6.141a4.368 4.368 0 0 0 1.067-2.973 4.312 4.312 0 0 0 .122-2.561z"/></svg>`,
         volumeHigh: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M9.741.85a.75.75 0 0 1 .375.65v13a.75.75 0 0 1-1.125.65l-6.925-4H0V4.85h2.066l6.925-4a.75.75 0 0 1 .75 0zM11.5 5.5a.75.75 0 0 1 .75-.75 4.5 4.5 0 0 1 0 6.5.75.75 0 1 1-1.06-1.06 3 3 0 0 0 0-4.38.75.75 0 0 1 .31-.31zm2.5-2.5a.75.75 0 0 1 .75-.75 8 8 0 0 1 0 11.5.75.75 0 1 1-1.06-1.06 6.5 6.5 0 0 0 0-9.38.75.75 0 0 1 .31-.31z"/></svg>`,
         volumeMute: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.86 5.47a.75.75 0 0 0-1.061 0l-1.47 1.47-1.47-1.47A.75.75 0 0 0 8.8 6.53L10.269 8l-1.47 1.47a.75.75 0 1 0 1.06 1.06l1.47-1.47 1.47 1.47a.75.75 0 0 0 1.06-1.06L12.39 8l1.47-1.47a.75.75 0 0 0 0-1.06zM9.741.85a.75.75 0 0 1 .375.65v13a.75.75 0 0 1-1.125.65l-6.925-4H0V4.85h2.066l6.925-4a.75.75 0 0 1 .75 0z"/></svg>`,
         compact: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M1.5 1h13A1.5 1.5 0 0 1 16 2.5v11a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 13.5v-11A1.5 1.5 0 0 1 1.5 1zm0 1.5a.5.5 0 0 0-.5.5v2h14V3a.5.5 0 0 0-.5-.5h-13zM15 6H1v7.5a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5V6z"/></svg>`,
@@ -215,21 +360,27 @@
 
     // Pushes current settings into an open mini player window
     function applySettings() {
-        if (!pipWindow || pipWindow.closed) return;
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         doc.documentElement.style.setProperty("--idle-opacity", String(settings.idleOpacity));
         doc.body.classList.toggle("links-off", !settings.clickToOpen);
         if (!settings.autoFade) doc.body.classList.remove("idle");
+        const wasFluid = doc.body.classList.contains("fluid");
+        doc.body.classList.toggle("fluid", !!settings.dynamicResize);
+        if (settings.dynamicResize) applyFluidLayout(true);
+        else if (wasFluid) leaveFluidLayout();
         refreshModeUi();
+        lastUpcomingKey = null; // lets the "Show next song" setting apply instantly
+        updateUpcomingBar();
     }
 
     // Updates the cover's hover icon, the Mini-mode button and their tooltips for the next mode
     function refreshModeUi() {
-        if (!pipWindow || pipWindow.closed) return;
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         const next = nextMode();
         // Only one usable mode: nothing to switch to, so hide the switch affordances
-        doc.body.classList.toggle("single-mode", next === currentMode);
+        doc.body.classList.toggle("single-mode", next === currentMode || !!settings.dynamicResize);
         const tip = `Switch to ${MODE_LABELS[next]} mode`;
         const modeIcon = doc.getElementById("cover-mode-icon");
         if (modeIcon) modeIcon.innerHTML = MODE_ICONS[next];
@@ -239,11 +390,6 @@
             miniBtn.setAttribute("title", tip);
         }
         doc.querySelector(".cover-container")?.setAttribute("title", tip);
-    }
-
-    // The next-up strip needs both the setting and upcomingSong.js to be present
-    function shouldShowUpcoming() {
-        return settings.showUpcoming && isUpcomingAvailable();
     }
 
     // Settings panel (opened by the topbar gear button)
@@ -433,6 +579,11 @@
                         return;
                     }
                     settings.modes = next;
+                    if (!next[currentMode]) {
+                        currentMode = MODES.find(mode => next[mode]);
+                        saveMode(currentMode);
+                        if (isPiPWindowOpen()) applyModeLayout();
+                    }
                     saveSettings();
                     applySettings();
                     chip.classList.toggle("on", next[m]);
@@ -458,7 +609,7 @@
         resetPos.addEventListener("click", () => {
             try { localStorage.removeItem(POS_KEY); } catch (e) {}
             // Don't immediately re-save the current spot while the window is open
-            lastSavedPos = (pipWindow && !pipWindow.closed) ? `${pipWindow.screenX},${pipWindow.screenY}` : "";
+            lastSavedPos = isPiPWindowOpen() ? `${pipWindow.screenX},${pipWindow.screenY}` : "";
             Spicetify.showNotification("Saved window position cleared");
         });
         const posControls = h("div", "mp-inline");
@@ -474,16 +625,18 @@
             slider("volumeStep", 1, 20, 1, v => v, v => v, v => `${v}%`));
         row("Click title / artist to open", "Opens the album or artist page in Spotify.", toggle("clickToOpen"));
 
-        section("Next up");
-        row("Show next-up bar",
-            (isUpcomingAvailable()
-                ? "upcomingSong.js detected."
-                : "upcomingSong.js wasn't found, so there's nothing to show.")
-            + " Applies the next time you open the mini player or switch modes.",
+        section("Top bar");
+        row("Show next song",
+            "Shows the first upcoming track from the playback queue in the top bar.",
             toggle("showUpcoming"));
 
+        section("Experimental");
+        row("Dynamic resizing",
+            "Resize the window freely and everything inside moves with it: the layout switches between Mini, Compact and Standard, scales up to fit, and shows a large album-art layout when tall. Replaces click-to-switch modes.",
+            toggle("dynamicResize"));
+
         const footer = h("div", "mp-footer");
-        const isOpen = !!(pipWindow && !pipWindow.closed);
+        const isOpen = isPiPWindowOpen();
         const toggleBtn = h("button", "mp-btn primary", isOpen ? "Close mini player" : "Open mini player");
         toggleBtn.addEventListener("click", () => {
             toggleMiniPlayer();
@@ -554,8 +707,8 @@
             root.style.setProperty("--mp-pad-r", `${right}px`);
             root.style.setProperty("--mp-pad-rs", `${Math.max(0, right - 14)}px`);
 
-            const h = Math.max(240, Math.min(460, availH > 0 ? availH : 460, window.innerHeight * 0.62));
-            root.style.height = `${h}px`;
+            const modalHeight = Math.max(240, Math.min(460, availH > 0 ? availH : 460, window.innerHeight * 0.62));
+            root.style.height = `${modalHeight}px`;
             styleModalCard();
             return true;
         };
@@ -580,7 +733,7 @@
     }
 
     function getTrackMetadata() {
-        const item = Spicetify.Player.data?.item;
+        const item = playerState.currentTrack;
         if (!item) {
             return {
                 title: "No track playing",
@@ -607,7 +760,13 @@
         }
         const artists = artistList.length ? artistList.map(a => a.name).join(", ") : "Unknown Artist";
         const album = item.album?.name || item.metadata?.album_title || "";
-        const cover = item.metadata?.image_xlarge_url || item.metadata?.image_large_url || item.metadata?.image_url || (item.images && item.images[0]?.url) || "";
+        const cover = normalizeImageUrl(
+            item.metadata?.image_xlarge_url ||
+            item.metadata?.image_large_url ||
+            item.metadata?.image_url ||
+            item.images?.[0]?.url ||
+            ""
+        );
 
         return {
             title,
@@ -616,48 +775,165 @@
             albumUri: item.album?.uri || item.metadata?.album_uri || "",
             artistList,
             cover,
-            duration: Spicetify.Player.getDuration() || (item.duration?.milliseconds || 0)
+            duration: playerState.duration || (item.duration?.milliseconds || 0)
         };
     }
 
-    // Window size for the current mode, including the "Next up" strip when enabled.
-    // The strip is only (re)evaluated on open / mode switch, because Document PiP windows
-    // can only be resized from a user gesture, not on every track change.
+    // ---------- Experimental: dynamic resizing ----------
+    // With "Dynamic resizing" on, the window is freely resizable. Its size picks the layout
+    // (Mini / Compact / Standard, plus a big album-art layout when tall) and sets --s (scale)
+    // and --art (cover size), so everything inside the card moves and grows to fit.
+
+    // Per-window bookkeeping: a freshly opened window starts with a clean slate
+    function fluidState() {
+        if (fluid.win !== pipWindow) {
+            fluid.win = pipWindow;
+            fluid.sig = "";
+            fluid.prevSize = null;
+        }
+        return fluid;
+    }
+
+    // Size to open at: the last size you resized to when dynamic resizing is on, else the mode's fixed size
+    function getOpenSize() {
+        if (settings.dynamicResize) {
+            try {
+                const saved = JSON.parse(localStorage.getItem(SIZE_KEY) || "null");
+                if (saved && Number.isFinite(saved.w) && Number.isFinite(saved.h)) {
+                    return {
+                        width: clampNum(saved.w, FLUID_MIN_WIDTH, 1600, STANDARD_WIDTH),
+                        height: clampNum(saved.h, FLUID_MIN_HEIGHT, 1200, STANDARD_HEIGHT + UPCOMING_BAR_HEIGHT)
+                    };
+                }
+            } catch (err) {}
+        }
+        return getTargetSize();
+    }
+
+    function saveWindowSize() {
+        if (!settings.dynamicResize || !isPiPWindowOpen() || queueOpen) return;
+        if (Date.now() < positionSaveEnabledAt) return;
+        const w = pipWindow.innerWidth;
+        const h = pipWindow.innerHeight;
+        // A closing window reports 0x0, so only real sizes are stored
+        if (!(w >= FLUID_MIN_WIDTH) || !(h >= FLUID_MIN_HEIGHT)) return;
+        try {
+            localStorage.setItem(SIZE_KEY, JSON.stringify({ w, h }));
+        } catch (err) {}
+    }
+
+    // Which of the three layouts fits this window (w = window width, ch = height left for the card)
+    function pickFluidMode(w, ch) {
+        let want;
+        if (ch < 78 || (ch < 150 && w < 400)) want = "mini";
+        else if (ch < 150) want = "compact";
+        else want = "standard";
+        const list = enabledModes();
+        if (list.includes(want)) return want;
+        // That layout is switched off in settings: use the closest one that's still enabled
+        const wi = MODES.indexOf(want);
+        return list.slice().sort((a, b) => Math.abs(MODES.indexOf(a) - wi) - Math.abs(MODES.indexOf(b) - wi))[0];
+    }
+
+    function applyFluidLayout(force = false) {
+        if (!isPiPWindowOpen() || !settings.dynamicResize || queueOpen) return;
+        const state = fluidState();
+        const doc = pipWindow.document;
+        const w = pipWindow.innerWidth;
+        // Under 74px tall the top bar would leave the card less than the 48px Mini needs, so the bar steps aside
+        const slim = pipWindow.innerHeight < UPCOMING_BAR_HEIGHT + MINI_HEIGHT;
+        const ch = pipWindow.innerHeight - (slim ? 0 : UPCOMING_BAR_HEIGHT); // the height the card actually gets
+        if (!(w > 0) || !(ch > 0)) return;
+
+        const mode = pickFluidMode(w, ch);
+        const art = mode === "standard" && ch >= FLUID_ART_MIN_HEIGHT;
+        const base = mode === "mini" ? [MINI_WIDTH, MINI_HEIGHT]
+            : mode === "compact" ? [COMPACT_WIDTH, COMPACT_HEIGHT]
+            : [STANDARD_WIDTH, STANDARD_HEIGHT];
+        // Scale relative to the layout's design size (never below 1: the layouts are already tight)
+        const raw = art ? w / STANDARD_WIDTH : Math.min(w / base[0], ch / base[1]);
+        const s = Math.round(Math.min(art ? 1.5 : 1.8, Math.max(1, raw)) * 20) / 20;
+        // Album art takes whatever height is left above the title, timeline and controls
+        const artSize = art ? Math.round(Math.max(64, Math.min(w - 56, ch - 165 * s, 420))) : 0;
+
+        // Controls follow the window. Standard/art: the transport row is exactly centered, volume hugs the right
+        // and shows a slider only when its side has room (otherwise just the mute icon). Compact/Mini: once the
+        // window is wide enough for it, the controls sit in the middle with the title left and close right.
+        const side = (w - 28 - 168 * s) / 2; // room on each side of the transport row
+        const volW = Math.floor(Math.min(160, side - 22 * s - 14));
+        const iconOnly = mode === "standard" && volW < 40;
+        const ctr = (mode === "compact" && w >= 240 + 300 * s) || (mode === "mini" && w >= 260 + 160 * s);
+        // Narrow: no room for an inline slider, so the speaker button opens the volume row (as in Compact)
+        const miniVol = mode === "mini";
+        // Absolute minimum (240 wide): drop shuffle/repeat so title, transport, volume and close still fit
+        const tiny = mode === "mini" && w < 300;
+
+        const sig = `${mode}|${art}|${s}|${artSize}|${ctr}|${iconOnly}|${volW}|${miniVol}|${tiny}|${slim}`;
+        if (!force && sig === state.sig) return;
+        state.sig = sig;
+
+        if (mode !== currentMode) {
+            currentMode = mode; // deliberately not saved: the size decides, your saved mode stays as it was
+            applyModeLayout();
+        }
+        doc.body.classList.toggle("art-layout", art);
+        doc.documentElement.style.setProperty("--s", String(s));
+        doc.documentElement.style.setProperty("--art", `${artSize}px`);
+        doc.documentElement.style.setProperty("--vol-w", `${Math.max(40, volW)}px`);
+        doc.body.classList.toggle("ctr-controls", ctr);
+        doc.body.classList.toggle("vol-icon-only", iconOnly);
+        doc.body.classList.toggle("mini-vol", miniVol);
+        doc.body.classList.toggle("tiny", tiny);
+        doc.body.classList.toggle("slim", slim);
+        doc.getElementById("btn-volume-icon")?.setAttribute("title", iconOnly ? "Volume" : "Mute / Unmute");
+        // Layout changed so the volume row isn't available any more: close it
+        if (mode !== "compact" && !iconOnly && !miniVol) {
+            doc.getElementById("volume-popup")?.classList.remove("open");
+            doc.body.classList.remove("volume-open");
+        }
+        // Font sizes just changed, so the title may now overflow (or no longer overflow)
+        safeSetTimeout(() => updateMarqueeEffect(true), 50);
+    }
+
+    // Turning dynamic resizing off while the window is open: back to the fixed, saved mode
+    function leaveFluidLayout() {
+        if (!isPiPWindowOpen()) return;
+        const doc = pipWindow.document;
+        doc.body.classList.remove("fluid", "art-layout", "ctr-controls", "vol-icon-only", "mini-vol", "tiny", "slim");
+        doc.documentElement.style.removeProperty("--s");
+        doc.documentElement.style.removeProperty("--art");
+        doc.documentElement.style.removeProperty("--vol-w");
+        const state = fluidState();
+        state.sig = "";
+        state.prevSize = null;
+        currentMode = loadMode();
+        applyModeLayout(); // also snaps the window back to that mode's fixed size
+    }
+
+    // Compact and Mini grow to fit the reduced queue panel while it is open.
     function getTargetSize() {
         const SIZES = {
             standard: { width: STANDARD_WIDTH, height: STANDARD_HEIGHT },
             compact: { width: COMPACT_WIDTH, height: COMPACT_HEIGHT },
             mini: { width: MINI_WIDTH, height: MINI_HEIGHT }
         };
+        const size = SIZES[currentMode];
+        const height = queueOpen && currentMode !== "standard"
+            ? Math.max(size.height, QUEUE_PANEL_HEIGHT) + UPCOMING_BAR_HEIGHT
+            : size.height + UPCOMING_BAR_HEIGHT;
         return {
-            width: SIZES[currentMode].width,
-            height: SIZES[currentMode].height + (upcomingBarEnabled ? UPCOMING_BAR_HEIGHT : 0)
+            width: size.width,
+            height
         };
     }
 
-    // upcomingSong.js injects #upcomingSongDiv into Spotify's now-playing bar. If it isn't there,
-    // the extension isn't installed/loaded and the mini player just doesn't show the bar.
-    function isUpcomingAvailable() {
-        return !!document.getElementById("upcomingSongDiv");
-    }
-
-    // Reads what upcomingSong.js is currently showing so both always agree on what's next.
-    function readUpcomingFromExtension() {
-        const titleEl = document.getElementById("upcomingSongTitle");
-        if (!titleEl) return null;
-        const title = (titleEl.textContent || "").trim();
-        // The extension uses this sentinel when the queue has no next track
-        if (!title || title === "NoSongWasFound") return { title: "", artist: "" };
-        const artist = (document.getElementById("upcomingSongArtist")?.textContent || "").trim();
-        return { title, artist };
-    }
-
     function updateUpcomingBar() {
-        if (!pipWindow || pipWindow.closed || !upcomingBarEnabled) return;
-        const info = readUpcomingFromExtension();
-        const title = info?.title || "";
-        const artist = info?.artist || "";
-        const key = `${title}\u0000${artist}`;
+        if (!isPiPWindowOpen()) return;
+        const active = settings.showUpcoming;
+        const nextTrack = active ? playerState.queue[0] : null;
+        const title = nextTrack?.title || "";
+        const artist = nextTrack?.artist || "";
+        const key = `${active}\u0000${title}\u0000${artist}`;
         if (key === lastUpcomingKey) return;
         lastUpcomingKey = key;
 
@@ -667,6 +943,7 @@
         const titleEl = doc.getElementById("upcoming-title");
         const artistEl = doc.getElementById("upcoming-artist");
         if (!bar || !text || !titleEl || !artistEl) return;
+        bar.classList.toggle("no-next", !active);
 
         if (title) {
             titleEl.textContent = title;
@@ -686,21 +963,427 @@
         text.classList.add("flash");
     }
 
-    function setupUpcomingObserver() {
-        if (upcomingObserver) {
-            upcomingObserver.disconnect();
-            upcomingObserver = null;
-        }
-        if (!upcomingBarEnabled) return;
-        const target = document.getElementById("upcomingSongDiv") || document.querySelector(".main-nowPlayingBar-left");
-        if (target) {
-            upcomingObserver = new MutationObserver(() => {
-                if (pipWindow && !pipWindow.closed && upcomingBarEnabled) {
-                    updateUpcomingBar();
-                }
+    // ---------- Queue ----------
+    function normalizeImageUrl(raw) {
+        if (raw.startsWith("spotify:image:")) return `https://i.scdn.co/image/${raw.split(":")[2]}`;
+        return raw.startsWith("http") ? raw : "";
+    }
+
+    function queueImageUrl(md) {
+        return normalizeImageUrl(md.image_small_url || md.image_url || md.image_large_url || md.image_xlarge_url || "");
+    }
+
+    function sleep(ms) {
+        return pipResources ? pipResources.delay(ms) : Promise.resolve(false);
+    }
+
+    const SpotifyAdapter = {
+        async play(uri, options = {}) {
+            const api = Spicetify.Platform?.PlayerAPI;
+            if (typeof api?.play === "function") {
+                return api.play({ uri, url: `context://${uri}` }, {}, options);
+            }
+            if (typeof Spicetify.Player?.playUri === "function") {
+                return Spicetify.Player.playUri(uri, {}, options);
+            }
+            throw new Error("No play API available");
+        },
+
+        async removeFromQueue(item) {
+            const payload = [{ uri: item.uri, uid: item.uid }];
+            const api = Spicetify.Platform?.PlayerAPI;
+            if (typeof api?.removeFromQueue === "function") {
+                return api.removeFromQueue(payload);
+            }
+            if (typeof Spicetify.removeFromQueue === "function") {
+                return Spicetify.removeFromQueue(payload);
+            }
+            throw new Error("Remove from queue isn't available");
+        },
+
+        async moveToNext(item) {
+            const queue = Spicetify.Platform?.PlayerAPI?._queue;
+            const state = queue?._queue;
+            const client = queue?._client;
+            if (!Array.isArray(state?.nextTracks) || typeof client?.setQueue !== "function") {
+                throw new Error("Queue reordering isn't available");
+            }
+
+            const nextTracks = [...state.nextTracks];
+            let index = item.uid
+                ? nextTracks.findIndex(track => track?.contextTrack?.uid === item.uid)
+                : -1;
+            if (index < 0) index = nextTracks.findIndex(track => track?.contextTrack?.uri === item.uri);
+            if (index < 0) throw new Error("Track is no longer in the queue");
+            if (index === 0) return false;
+
+            const [track] = nextTracks.splice(index, 1);
+            nextTracks.unshift(track);
+            await client.setQueue({
+                nextTracks,
+                prevTracks: state.prevTracks,
+                queueRevision: state.queueRevision
             });
-            upcomingObserver.observe(target, { childList: true, subtree: true, characterData: true });
+            return true;
+        },
+
+        getQueue() {
+            const queue = Spicetify.Queue;
+            const next = Array.isArray(queue?.nextTracks) ? queue.nextTracks : [];
+            const currentUid = queue?.track?.contextTrack?.uid;
+            const items = [];
+            for (const track of next) {
+                const contextTrack = track?.contextTrack;
+                if (!contextTrack || (track.removed && track.removed.length) || contextTrack.uid === currentUid) continue;
+                const metadata = contextTrack.metadata || {};
+                const names = [];
+                for (let i = 0; ; i++) {
+                    const name = metadata[i === 0 ? "artist_name" : `artist_name:${i}`];
+                    if (!name) break;
+                    names.push(name);
+                }
+                items.push({
+                    uid: contextTrack.uid,
+                    uri: contextTrack.uri,
+                    title: metadata.title || metadata.name || "Unknown track",
+                    artist: names.join(", "),
+                    image: queueImageUrl(metadata),
+                    albumUri: metadata.album_uri || "",
+                    artistUri: metadata.artist_uri || "",
+                    fromQueue: track.provider === "queue"
+                });
+                if (items.length >= 100) break;
+            }
+            return items;
         }
+    };
+
+    function playerStateKey(key, value) {
+        if (key === "currentTrack") {
+            if (!value) return "";
+            const metadata = value.metadata || {};
+            const artists = (Array.isArray(value.artists) ? value.artists : [])
+                .map(artist => `${artist.uri || ""}:${artist.name || ""}`).join(",");
+            return [
+                value.uri || "",
+                value.name || "",
+                metadata.title || "",
+                metadata.album_title || "",
+                metadata.image_xlarge_url || metadata.image_large_url || metadata.image_url || value.images?.[0]?.url || "",
+                metadata.album_uri || value.album?.uri || "",
+                value.duration?.milliseconds || "",
+                artists
+            ].join("\u0000");
+        }
+        if (key === "queue") {
+            return value.map(item => [
+                item.uid || item.uri || "",
+                item.title || "",
+                item.artist || "",
+                item.image || "",
+                item.albumUri || "",
+                item.artistUri || "",
+                item.fromQueue ? "queue" : "context"
+            ].join("\u0000")).join("\u0001");
+        }
+        return value;
+    }
+
+    function publishPlayerState(patch) {
+        const changedKeys = new Set();
+        for (const [key, value] of Object.entries(patch)) {
+            if (!Object.is(playerStateKey(key, playerState[key]), playerStateKey(key, value))) {
+                changedKeys.add(key);
+            }
+            playerState[key] = value;
+        }
+        if (changedKeys.size) {
+            for (const listener of [...playerStateListeners]) {
+                try {
+                    listener(playerState, changedKeys);
+                } catch (err) {
+                    console.error("[MiniPlayer] Player state subscriber failed:", err);
+                }
+            }
+        }
+        return changedKeys;
+    }
+
+    function syncPlayerState(keys = Object.keys(playerState)) {
+        const requested = new Set(keys);
+        const needsPlayerData = ["currentTrack", "duration", "shuffle", "repeat"].some(key => requested.has(key));
+        const data = needsPlayerData ? Spicetify.Player.data || {} : {};
+        const patch = {};
+
+        if (requested.has("currentTrack")) patch.currentTrack = data.item || null;
+        if (requested.has("isPlaying")) patch.isPlaying = !!Spicetify.Player.isPlaying();
+        if (requested.has("progress")) patch.progress = Spicetify.Player.getProgress() || 0;
+        if (requested.has("duration")) {
+            patch.duration = Spicetify.Player.getDuration() || data.item?.duration?.milliseconds || 0;
+        }
+        if (requested.has("volume")) {
+            const volume = Spicetify.Player.getVolume();
+            patch.volume = Number.isFinite(volume) ? volume : playerState.volume;
+        }
+        if (requested.has("shuffle")) patch.shuffle = !!data.shuffle;
+        if (requested.has("repeat")) patch.repeat = Number(data.repeat) || 0;
+        if (requested.has("queue")) patch.queue = SpotifyAdapter.getQueue();
+        return publishPlayerState(patch);
+    }
+
+    function updatePlayerState(patch) {
+        return publishPlayerState(patch);
+    }
+
+    function subscribePlayerState(listener) {
+        playerStateListeners.add(listener);
+        const unsubscribe = () => playerStateListeners.delete(listener);
+        return pipResources ? pipResources.addCleanup(unsubscribe) : unsubscribe;
+    }
+
+    // Plays exactly this track, with no skipping through the ones before it
+    async function playQueueItem(it) {
+        const data = Spicetify.Player.data;
+        const startUri = data?.item?.uri;
+        const ctxUri = data?.context?.uri || data?.context_uri || "";
+        let ok = false;
+
+        // Tracks from the current playlist/album: restart that context directly at this track, so the
+        // rest of the playlist keeps going after it. If the change doesn't land (or the wrong track
+        // starts) we bail out immediately and play the track itself instead.
+        if (!it.fromQueue && ctxUri) {
+            try {
+                await SpotifyAdapter.play(ctxUri, {
+                    skipTo: { uri: it.uri, uid: it.uid, trackUri: it.uri, trackUid: it.uid }
+                });
+                for (let i = 0; i < 10; i++) {
+                    if (!await sleep(150) || !isPiPWindowOpen()) break;
+                    const cur = Spicetify.Player.data?.item?.uri;
+                    if (cur === it.uri) { ok = true; break; }
+                    if (cur && cur !== startUri) break; // something else started: stop waiting
+                }
+            } catch (err) {}
+        }
+
+        // Queued tracks (or if the above didn't land): play the track itself
+        if (!ok) {
+            try {
+                await SpotifyAdapter.play(it.uri);
+            } catch (err) {
+                console.warn("[MiniPlayer] Could not play track:", err);
+                Spicetify.showNotification("Couldn't play that track", true);
+            }
+        }
+        safeSetTimeout(() => syncPlayerState(["queue"]), 600);
+    }
+
+    async function removeQueueItem(it) {
+        try {
+            await SpotifyAdapter.removeFromQueue(it);
+        } catch (err) {
+            console.warn("[MiniPlayer] Could not remove from queue:", err);
+            Spicetify.showNotification("Couldn't remove that track from the queue", true);
+            return;
+        }
+        safeSetTimeout(() => syncPlayerState(["queue"]), 400);
+    }
+
+    async function putQueueItemNext(it) {
+        try {
+            const moved = await SpotifyAdapter.moveToNext(it);
+            if (!moved) {
+                Spicetify.showNotification("That track is already next");
+                return;
+            }
+        } catch (err) {
+            console.warn("[MiniPlayer] Could not move track to the front of the queue:", err);
+            Spicetify.showNotification("Couldn't put that track next", true);
+            return;
+        }
+        safeSetTimeout(() => syncPlayerState(["queue"]), 400);
+    }
+
+    async function copyTrackLink(it) {
+        const uri = String(it.uri || "");
+        const resource = /^spotify:(track|episode):([A-Za-z0-9]+)$/.exec(uri);
+        const isLocal = uri.startsWith("spotify:local:");
+        const link = resource
+            ? `https://open.spotify.com/${resource[1]}/${resource[2]}`
+            : isLocal ? uri : "";
+        if (!link) {
+            Spicetify.showNotification("No link is available for this item", true);
+            return;
+        }
+        try {
+            if (Spicetify.Platform?.ClipboardAPI?.copy) await Spicetify.Platform.ClipboardAPI.copy(link);
+            else await navigator.clipboard.writeText(link);
+            Spicetify.showNotification(isLocal ? "Spotify URI copied" : "Link copied");
+        } catch (err) {
+            Spicetify.showNotification("Couldn't copy the link", true);
+        }
+    }
+
+    // The three-dots menu on a queue row
+    function closeQueueMenu() {
+        queueMenuDisposers.forEach(dispose => dispose?.());
+        queueMenuDisposers = [];
+        const doc = queueMenuEl?.ownerDocument;
+        queueMenuEl?.remove();
+        queueMenuEl = null;
+        doc?.querySelectorAll(".queue-more.active").forEach(b => b.classList.remove("active"));
+    }
+
+    function openQueueMenu(it, anchor) {
+        closeQueueMenu();
+        if (!isPiPWindowOpen()) return;
+        const doc = pipWindow.document;
+
+        const menu = doc.createElement("div");
+        menu.className = "queue-menu";
+        menu.dataset.uid = String(it.uid || it.uri);
+        const add = (label, handler) => {
+            const b = doc.createElement("button");
+            b.className = "queue-menu-item";
+            b.textContent = label;
+            queueMenuDisposers.push(listenPiP(b, "click", (e) => {
+                e.stopPropagation();
+                closeQueueMenu();
+                handler();
+            }));
+            menu.appendChild(b);
+        };
+        const sep = () => {
+            const s = doc.createElement("div");
+            s.className = "queue-menu-sep";
+            menu.appendChild(s);
+        };
+
+        add("Put in next", () => putQueueItemNext(it));
+        add("Play now", () => playQueueItem(it));
+        if (it.fromQueue) add("Remove from queue", () => removeQueueItem(it));
+        if (it.albumUri || it.artistUri) sep();
+        if (it.albumUri) add("Go to album", () => openInSpotify(it.albumUri));
+        if (it.artistUri) add("Go to artist", () => openInSpotify(it.artistUri));
+        sep();
+        add(it.uri?.startsWith("spotify:local:") ? "Copy Spotify URI" : "Copy link", () => copyTrackLink(it));
+
+        doc.body.appendChild(menu);
+        anchor.classList.add("active");
+
+        // Keep the queue's three-dot column clear; flip above if there's no room below.
+        const r = anchor.getBoundingClientRect();
+        const mw = menu.offsetWidth;
+        const mh = menu.offsetHeight;
+        const W = pipWindow.innerWidth;
+        const H = pipWindow.innerHeight;
+        let left = r.left - mw - 4;
+        if (left < 8) left = Math.min(r.right + 4, W - mw - 8);
+        left = Math.max(8, left);
+        let top = r.bottom + 4;
+        if (top + mh > H - 8) top = Math.max(8, r.top - mh - 4);
+        menu.style.left = `${left}px`;
+        menu.style.top = `${top}px`;
+        queueMenuEl = menu;
+    }
+
+    // Rebuilds the list only when the queue actually changed, keeping the scroll position
+    function renderQueuePanel(force = false) {
+        if (!isPiPWindowOpen() || !queueOpen) return;
+        const doc = pipWindow.document;
+        const list = doc.getElementById("queue-list");
+        const count = doc.getElementById("queue-count");
+        if (!list || !count) return;
+
+        const items = playerState.queue;
+        const key = items.map(i => i.uid || i.uri).join("|");
+        if (!force && key === lastQueueKey) return;
+        lastQueueKey = key;
+        closeQueueMenu(); // the row it belonged to is about to be rebuilt
+
+        const scrollTop = list.scrollTop;
+        queueRenderDisposers.forEach(dispose => dispose?.());
+        queueRenderDisposers = [];
+        list.textContent = "";
+        count.textContent = items.length ? String(items.length) : "";
+
+        if (!items.length) {
+            const empty = doc.createElement("div");
+            empty.className = "queue-empty";
+            empty.textContent = "Nothing in the queue";
+            list.appendChild(empty);
+            return;
+        }
+
+        let lastGroup = null;
+        items.forEach((it, idx) => {
+            const group = it.fromQueue ? "Next in queue" : "Next up";
+            if (currentMode === "standard" && group !== lastGroup) {
+                const heading = doc.createElement("div");
+                heading.className = "queue-group";
+                heading.textContent = group;
+                list.appendChild(heading);
+            }
+            lastGroup = group;
+            const row = doc.createElement("div");
+            row.className = "queue-item";
+            row.title = "Play this track";
+
+            const img = doc.createElement("img");
+            img.className = "queue-img";
+            img.alt = "";
+            img.draggable = false;
+            if (it.image) img.src = it.image;
+            row.appendChild(img);
+
+            const text = doc.createElement("div");
+            text.className = "queue-text";
+            const name = doc.createElement("div");
+            name.className = "queue-name";
+            name.textContent = it.title;
+            const artist = doc.createElement("div");
+            artist.className = "queue-artist";
+            artist.textContent = it.artist;
+            text.appendChild(name);
+            text.appendChild(artist);
+            row.appendChild(text);
+
+            // Three dots: more actions for this track
+            const more = doc.createElement("button");
+            more.className = "queue-more";
+            more.title = "More";
+            more.innerHTML = ICONS.more;
+            queueRenderDisposers.push(listenPiP(more, "click", (e) => {
+                e.stopPropagation();
+                if (queueMenuEl && queueMenuEl.dataset.uid === String(it.uid || it.uri)) {
+                    closeQueueMenu();
+                    return;
+                }
+                openQueueMenu(it, more);
+            }));
+            row.appendChild(more);
+
+            // Clicking the row plays exactly this track
+            queueRenderDisposers.push(listenPiP(row, "click", () => playQueueItem(it)));
+            list.appendChild(row);
+        });
+        list.scrollTop = scrollTop;
+    }
+
+    // Expand compact queue windows while open, then restore their mode dimensions.
+    function applyQueueLayout() {
+        if (!isPiPWindowOpen()) return;
+        const doc = pipWindow.document;
+        closeQueueMenu();
+        if (!queueOpen) {
+            queueRenderDisposers.forEach(dispose => dispose?.());
+            queueRenderDisposers = [];
+        }
+        doc.body.classList.toggle("queue-open", queueOpen);
+        doc.getElementById("btn-queue")?.classList.toggle("active", queueOpen);
+        resizePiPWindowToMode();
+
+        lastQueueKey = null;
+        renderQueuePanel(true);
     }
 
     // Opens an album/artist page in the main Spotify window
@@ -716,7 +1399,7 @@
     }
 
     function restoreWindowPosition() {
-        if (!pipWindow || !settings.rememberPosition) return;
+        if (!isPiPWindowOpen() || !settings.rememberPosition) return;
         try {
             const saved = JSON.parse(localStorage.getItem(POS_KEY) || "null");
             if (!saved || !Number.isFinite(saved.x) || !Number.isFinite(saved.y)) return;
@@ -728,7 +1411,8 @@
     }
 
     function saveWindowPosition() {
-        if (!pipWindow || pipWindow.closed || !settings.rememberPosition) return;
+        saveWindowSize();
+        if (!isPiPWindowOpen() || !settings.rememberPosition) return;
         // Skip the first second after opening so a transient default position never overwrites the saved one
         if (Date.now() < positionSaveEnabledAt) return;
         const x = pipWindow.screenX;
@@ -745,7 +1429,7 @@
     // Opens or brings to focus the Document PiP Window
     async function openMiniPlayer() {
         if (isOpening) return;
-        if (pipWindow && !pipWindow.closed) {
+        if (isPiPWindowOpen()) {
             try { pipWindow.focus?.(); } catch (e) {}
             return;
         }
@@ -756,11 +1440,11 @@
         }
 
         isOpening = true;
-        cleanupPiPTimers();
+        cleanupPiPResources();
 
         try {
-            upcomingBarEnabled = shouldShowUpcoming();
-            const { width, height } = getTargetSize();
+            queueOpen = false;
+            const { width, height } = getOpenSize();
 
             // Request floating document PiP window
             // @ts-ignore
@@ -768,6 +1452,8 @@
                 width,
                 height
             });
+            pipResources = createPiPResourceRegistry(pipWindow);
+            syncPlayerState();
             pipWindowFrameWidth = pipWindow.outerWidth - pipWindow.innerWidth;
             pipWindowFrameHeight = pipWindow.outerHeight - pipWindow.innerHeight;
 
@@ -788,26 +1474,37 @@
             // Set Initial State
             renderFullUI();
 
-            setupUpcomingObserver();
-
             // Bind Event Listeners
             bindMiniPlayerEvents();
 
             // Recalculate text overflow/marquee on window resize without illegal resizeTo() calls
-            pipWindow.addEventListener("resize", () => {
-                updateMarqueeEffect(true);
+            let resizeFrame = null;
+            listenPiP(pipWindow, "resize", () => {
+                // One layout pass per frame while a window edge is being dragged
+                if (resizeFrame !== null || !pipResources) return;
+                resizeFrame = pipResources.requestAnimationFrame(() => {
+                    resizeFrame = null;
+                    applyFluidLayout();
+                    updateMarqueeEffect(true);
+                });
             });
 
             // Smooth requestAnimationFrame loop for active visual progress updates
             startProgressLoop();
 
-            // Slower background timer (every 2.5s) for position saving, upcoming sync, and idle checks
-            updateInterval = pipWindow.setInterval(slowBackgroundTick, 2500);
+            // Player state sync is separate from the queue and window-position polling.
+            pipResources.setInterval(syncPlayerStateTick, PLAYER_STATE_SYNC_MS);
+            pipResources.setInterval(() => {
+                if (settings.showUpcoming || queueOpen) syncPlayerState(["queue"]);
+            }, QUEUE_STATE_SYNC_MS);
+            pipResources.setInterval(saveWindowPosition, WINDOW_POSITION_SYNC_MS);
 
             // Handle PiP Window Close
-            pipWindow.addEventListener("pagehide", () => {
+            const win = pipWindow;
+            listenPiP(win, "pagehide", () => {
+                if (pipWindow !== win) return;
                 saveWindowPosition();
-                cleanupPiPTimers();
+                cleanupPiPResources();
                 pipWindow = null;
                 updateButtonStates(false);
             });
@@ -816,7 +1513,7 @@
         } catch (err) {
             console.error("[MiniPlayer] Failed to open Document PiP window:", err);
             Spicetify.showNotification("Failed to open Mini Player window.", true);
-            cleanupPiPTimers();
+            cleanupPiPResources();
             pipWindow = null;
             updateButtonStates(false);
         } finally {
@@ -825,8 +1522,9 @@
     }
 
     function closeMiniPlayer() {
-        cleanupPiPTimers();
-        if (pipWindow && !pipWindow.closed) {
+        if (isPiPWindowOpen()) saveWindowPosition();
+        cleanupPiPResources();
+        if (isPiPWindowOpen()) {
             try { pipWindow.close(); } catch (e) {}
         }
         pipWindow = null;
@@ -835,7 +1533,7 @@
 
     function toggleMiniPlayer() {
         if (isOpening) return;
-        if (pipWindow && !pipWindow.closed) {
+        if (isPiPWindowOpen()) {
             closeMiniPlayer();
         } else {
             openMiniPlayer();
@@ -873,21 +1571,28 @@
             }
             body {
                 flex-direction: column;
+                position: relative;
             }
-            /* With the next-up strip, pin it to the very top and centre the card in the remaining space,
-               so any spare window height never shows up as an empty bar above the strip */
-            body.has-upcoming {
+            /* Keep the top bar and card in normal flow so queue open/close doesn't redistribute free space. */
+            body {
                 justify-content: flex-start;
             }
-            body.has-upcoming .miniplayer-card {
-                margin-top: auto;
-                margin-bottom: auto;
-            }
-            /* "Next up" strip above the card (from upcomingSong.js). Hidden unless enabled. */
-            .upcoming-bar {
-                display: none;
+            .player-surface {
                 position: relative;
                 z-index: 1;
+                display: flex;
+                flex: 0 0 100%;
+                flex-direction: column;
+                align-items: center;
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+            }
+            /* Top bar above the card: queue button and optional next-track text */
+            .upcoming-bar {
+                display: flex;
+                position: relative;
+                z-index: 6;
                 flex: 0 0 ${UPCOMING_BAR_HEIGHT}px;
                 height: ${UPCOMING_BAR_HEIGHT}px;
                 width: 100%;
@@ -902,8 +1607,216 @@
                 -webkit-app-region: drag;
                 cursor: grab;
             }
-            body.has-upcoming .upcoming-bar {
+            /* Queue button, pinned to the right end of the top bar */
+            .queue-btn {
+                margin-left: auto;
+                flex-shrink: 0;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 20px;
+                height: 20px;
+                padding: 0;
+                border: none;
+                border-radius: 50%;
+                background: transparent;
+                color: #b3b3b3;
+                transition: color 0.15s ease, background 0.15s ease;
+            }
+            .queue-btn:hover {
+                color: #ffffff;
+                background: rgba(255, 255, 255, 0.12);
+            }
+            .queue-btn.active {
+                color: #1ed760;
+            }
+            /* When "Show next song" is off, the bar only holds the queue button */
+            .upcoming-bar.no-next .upcoming-label,
+            .upcoming-bar.no-next .upcoming-text {
+                display: none;
+            }
+            /* Queue panel */
+            .queue-panel {
+                display: none;
+                position: absolute;
+                z-index: 5;
+                left: 0;
+                top: ${UPCOMING_BAR_HEIGHT}px;
+                flex: 0 0 auto;
+                height: ${QUEUE_PANEL_HEIGHT}px;
+                width: 100%;
+                min-width: 100%;
+                max-width: 100%;
+                min-height: 0;
+                max-height: calc(100% - ${UPCOMING_BAR_HEIGHT}px);
+                flex-direction: column;
+                overflow: hidden;
+                resize: none;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                background: rgba(0, 0, 0, 0.28);
+                backdrop-filter: blur(18px);
+                -webkit-app-region: no-drag;
+            }
+            .queue-panel * {
+                -webkit-app-region: no-drag;
+            }
+            body.queue-open .queue-panel {
                 display: flex;
+            }
+            body.queue-open .miniplayer-card {
+                visibility: hidden;
+                pointer-events: none;
+            }
+            .queue-header {
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                padding: 10px 14px 4px;
+                font-size: 13px;
+                font-weight: 700;
+                color: #ffffff;
+            }
+            .queue-count {
+                font-size: 11px;
+                font-weight: 500;
+                color: #a7a7a7;
+            }
+            .queue-list {
+                flex: 1 1 auto;
+                min-height: 0;
+                overflow-x: hidden;
+                overflow-y: auto;
+                padding: 0 2px 8px 8px;
+                overscroll-behavior-y: contain;
+                touch-action: pan-y;
+            }
+            /* Same slim, hover-only, Spotify-style scrollbar as the settings panel */
+            .queue-list::-webkit-scrollbar { width: 12px; }
+            .queue-list::-webkit-scrollbar-button { display: none !important; }
+            .queue-list::-webkit-scrollbar-track { background: transparent; }
+            .queue-list::-webkit-scrollbar-thumb {
+                min-height: 40px;
+                background-color: rgba(255, 255, 255, 0);
+                border: 3px solid transparent;
+                border-radius: 999px;
+                background-clip: padding-box;
+                transition: background-color 0.15s ease;
+            }
+            .queue-list:hover::-webkit-scrollbar-thumb { background-color: rgba(255, 255, 255, 0.3); }
+            .queue-list::-webkit-scrollbar-thumb:hover { background-color: rgba(255, 255, 255, 0.55); }
+            .queue-group {
+                padding: 8px 6px 4px;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.02em;
+                color: #a7a7a7;
+            }
+            .queue-item {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 5px 6px;
+                min-height: 44px;
+                border-radius: 6px;
+                cursor: pointer;
+            }
+            .queue-item:hover {
+                background: rgba(255, 255, 255, 0.08);
+            }
+            .queue-img {
+                width: 34px;
+                height: 34px;
+                flex-shrink: 0;
+                border-radius: 4px;
+                object-fit: cover;
+                background: #282828;
+            }
+            .queue-text {
+                min-width: 0;
+                flex: 1;
+            }
+            .queue-name {
+                font-size: 12.5px;
+                font-weight: 600;
+                color: #ffffff;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .queue-artist {
+                margin-top: 1px;
+                font-size: 11px;
+                color: #a7a7a7;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            /* Three dots on each row: shown on hover, or while its menu is open */
+            .queue-more {
+                flex-shrink: 0;
+                width: 24px;
+                height: 24px;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                border: none;
+                border-radius: 50%;
+                background: transparent;
+                color: #b3b3b3;
+                opacity: 0;
+                transition: opacity 0.12s ease, color 0.12s ease, background 0.12s ease;
+            }
+            .queue-item:hover .queue-more,
+            .queue-more.active {
+                opacity: 1;
+            }
+            .queue-more:hover,
+            .queue-more.active {
+                color: #ffffff;
+                background: rgba(255, 255, 255, 0.12);
+            }
+            /* Context menu opened by the three dots */
+            .queue-menu {
+                position: fixed;
+                z-index: 30;
+                min-width: 160px;
+                padding: 4px;
+                border-radius: 6px;
+                background: #282828;
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.08);
+                -webkit-app-region: no-drag !important;
+            }
+            .queue-menu * {
+                -webkit-app-region: no-drag !important;
+            }
+            .queue-menu-item {
+                display: block;
+                width: 100%;
+                padding: 8px 10px;
+                border: none;
+                border-radius: 3px;
+                background: transparent;
+                color: #e6e6e6;
+                font-size: 12px;
+                font-weight: 500;
+                text-align: left;
+                white-space: nowrap;
+            }
+            .queue-menu-item:hover {
+                background: rgba(255, 255, 255, 0.1);
+                color: #ffffff;
+            }
+            .queue-menu-sep {
+                height: 1px;
+                margin: 4px 6px;
+                background: rgba(255, 255, 255, 0.1);
+            }
+            .queue-empty {
+                padding: 28px 14px;
+                text-align: center;
+                font-size: 12px;
+                color: #a7a7a7;
             }
             .upcoming-label {
                 display: inline-flex;
@@ -953,12 +1866,11 @@
                 from { opacity: 0; transform: translateY(3px); }
                 to { opacity: 1; transform: none; }
             }
-            /* Auto-fade: dim everything when the mouse isn't over the window */
-            .miniplayer-card, .upcoming-bar {
+            /* Fade overlapping player and queue content as one layer. */
+            .player-surface {
                 transition: opacity 0.35s ease;
             }
-            body.idle .miniplayer-card,
-            body.idle .upcoming-bar {
+            body.idle .player-surface {
                 opacity: var(--idle-opacity, 0.35);
             }
             /* Ghost effect: the content fades hard, but the blurred cover-art backdrop stays visible,
@@ -1056,6 +1968,24 @@
             .icon-btn.active {
                 color: #1db954;
             }
+            .icon-btn.repeat-one {
+                position: relative;
+            }
+            .icon-btn.repeat-one::after {
+                content: "1";
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                padding: 0 1px;
+                border-radius: 2px;
+                background: #121212;
+                color: currentColor;
+                font-size: 7px;
+                font-weight: 700;
+                line-height: 1;
+                pointer-events: none;
+            }
             /* Track Section */
             .track-section {
                 display: flex;
@@ -1072,7 +2002,7 @@
                 overflow: hidden;
                 box-shadow: 0 4px 14px rgba(0,0,0,0.55);
                 background: #282828;
-                /* Interactive: double-click switches between compact and standard mode */
+                /* Clicking the album art switches player mode. */
                 pointer-events: auto;
                 cursor: pointer;
                 -webkit-app-region: no-drag !important;
@@ -1179,13 +2109,11 @@
                 line-height: 1.2;
             }
             /* Clickable title (album page) and artist names (artist pages) */
-            .track-title.linkable,
             .track-title-text.linkable,
             .artist-link.linkable {
                 -webkit-app-region: no-drag !important;
                 cursor: pointer;
             }
-            .track-title.linkable:hover,
             .track-title-text.linkable:hover {
                 text-decoration: underline;
             }
@@ -1194,26 +2122,15 @@
                 text-decoration: underline;
             }
             /* Settings: "Click title / artist to open" turned off -> behave like plain, draggable text */
-            body.links-off .track-title.linkable,
             body.links-off .track-title-text.linkable,
             body.links-off .artist-link.linkable {
                 -webkit-app-region: drag !important;
                 cursor: inherit;
             }
-            body.links-off .track-title.linkable:hover,
             body.links-off .track-title-text.linkable:hover,
             body.links-off .artist-link.linkable:hover {
                 text-decoration: none;
                 color: inherit;
-            }
-            .heart-btn {
-                flex-shrink: 0;
-                padding: 3px;
-                margin-left: 2px;
-            }
-            .heart-btn:hover {
-                background: transparent;
-                transform: scale(1.1);
             }
             /* Progress Scrubber (Standard Mode) */
             .progress-section {
@@ -1368,7 +2285,7 @@
             body.compact-mode .compact-actions-cluster {
                 display: contents !important;
             }
-            /* Expand + close stacked vertically at the far right */
+            /* Keep the close button at the far right. */
             body.compact-mode .compact-actions-cluster .window-actions {
                 flex-direction: column-reverse;
                 gap: 0;
@@ -1556,6 +2473,13 @@
             body.mini-mode .track-artist-inline .artist-link.linkable:hover {
                 color: #ffffff;
             }
+            body.mini-mode .queue-header {
+                display: flex;
+                padding: 6px 12px 2px;
+            }
+            body.mini-mode .queue-list {
+                padding-bottom: 0;
+            }
             body.mini-mode .compact-actions-cluster .window-actions {
                 flex-direction: row;
                 gap: 2px;
@@ -1596,6 +2520,145 @@
                 pointer-events: none;
                 transition: opacity 0.15s ease, transform 0.15s ease;
             }
+            /* ======================================================== */
+            /* FLUID (experimental dynamic resizing)                     */
+            /* The card fills the window. JS picks the layout from the   */
+            /* window size and sets --s (scale) and --art (cover size).  */
+            /* ======================================================== */
+            body.fluid .miniplayer-card {
+                width: 100%;
+                max-width: none;
+                min-width: 0;
+                height: auto;
+                min-height: 0;
+                max-height: none;
+                flex: 1 1 auto;
+            }
+            /* The queue fills whatever window it has */
+            body.fluid .queue-panel {
+                height: auto;
+                max-height: none;
+                bottom: 0;
+            }
+            body.fluid .cover-container { width: calc(52px * var(--s, 1)); height: calc(52px * var(--s, 1)); }
+            body.fluid.compact-mode .cover-container { width: calc(42px * var(--s, 1)); height: calc(42px * var(--s, 1)); }
+            body.fluid .track-title { font-size: calc(13.5px * var(--s, 1)); }
+            body.fluid.compact-mode .track-title { font-size: calc(12.5px * var(--s, 1)); }
+            body.fluid .track-artist { font-size: calc(11.5px * var(--s, 1)); }
+            body.fluid.compact-mode .track-artist { font-size: calc(10.5px * var(--s, 1)); }
+            body.fluid .time-label { font-size: calc(10px * var(--s, 1)); min-width: calc(26px * var(--s, 1)); }
+            body.fluid.compact-mode .time-label { font-size: calc(9.5px * var(--s, 1)); min-width: calc(24px * var(--s, 1)); }
+            body.fluid .icon-btn { width: calc(22px * var(--s, 1)); height: calc(22px * var(--s, 1)); }
+            body.fluid .icon-btn svg,
+            body.fluid .play-pause-btn svg { scale: var(--s, 1); }
+            body.fluid .play-pause-btn { width: calc(32px * var(--s, 1)); height: calc(32px * var(--s, 1)); }
+            body.fluid:not(.compact-mode) .playback-controls { gap: calc(12px * var(--s, 1)); }
+            body.fluid .controls-spacer,
+            body.fluid .volume-section { width: auto; }
+            body.fluid .volume-section .volume-slider { width: var(--vol-w, calc(48px * var(--s, 1))); }
+            body.fluid.vol-icon-only .volume-section .volume-slider { display: none; }
+            /* Standard / art: three equal-sided columns keep the transport row exactly centered,
+               whatever the volume section needs; volume sits at the right edge */
+            body.fluid .controls-section {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+                align-items: center;
+            }
+            body.fluid .controls-spacer { grid-column: 1; }
+            body.fluid .controls-section .playback-controls { grid-column: 2; justify-self: center; }
+            body.fluid .volume-section { grid-column: 3; justify-self: end; }
+            /* Compact, wide enough: cover + title left, controls dead center, close right */
+            body.fluid.ctr-controls.compact-mode:not(.mini-mode) .track-section {
+                display: grid;
+                grid-template-columns: calc(42px * var(--s, 1)) minmax(0, 1fr) auto minmax(0, 1fr) calc(42px * var(--s, 1));
+                column-gap: calc(10px * var(--s, 1));
+                align-items: center;
+            }
+            body.fluid.ctr-controls.compact-mode:not(.mini-mode) .cover-container { grid-column: 1; grid-row: 1; }
+            body.fluid.ctr-controls.compact-mode:not(.mini-mode) .meta-container { grid-column: 2; grid-row: 1; }
+            body.fluid.ctr-controls.compact-mode:not(.mini-mode) .compact-actions-cluster .playback-controls { grid-column: 3; grid-row: 1; margin: 0; }
+            body.fluid.ctr-controls.compact-mode:not(.mini-mode) .compact-actions-cluster .window-actions { grid-column: 5; grid-row: 1; justify-self: end; }
+            /* Mini, wide enough: title left, controls dead center, mode + close right */
+            body.fluid.ctr-controls.mini-mode .track-section {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+                column-gap: calc(10px * var(--s, 1));
+                align-items: center;
+            }
+            body.fluid.ctr-controls.mini-mode .meta-container { grid-column: 1; grid-row: 1; }
+            body.fluid.ctr-controls.mini-mode .compact-actions-cluster .playback-controls { grid-column: 2; grid-row: 1; margin: 0; }
+            body.fluid.ctr-controls.mini-mode .compact-actions-cluster .window-actions { grid-column: 3; grid-row: 1; justify-self: end; }
+            /* Narrow Standard / art layout: the speaker opens the same volume row as Compact, in place of the controls */
+            body.fluid:not(.compact-mode) .controls-section { transition: opacity 0.22s ease; }
+            body.fluid.vol-icon-only:not(.compact-mode) .volume-popup {
+                display: flex;
+                left: 14px;
+                right: 14px;
+                bottom: 12px;
+                height: calc(32px * var(--s, 1));
+                opacity: 0;
+                visibility: hidden;
+                pointer-events: none;
+                transform: translateY(3px);
+                transition: opacity 0.22s ease, transform 0.22s ease, visibility 0s linear 0.22s;
+            }
+            body.fluid.vol-icon-only:not(.compact-mode) .volume-popup.open {
+                opacity: 1;
+                visibility: visible;
+                pointer-events: auto;
+                transform: none;
+                transition: opacity 0.22s ease, transform 0.22s ease, visibility 0s;
+            }
+            body.fluid.vol-icon-only:not(.compact-mode).volume-open .controls-section {
+                opacity: 0;
+                pointer-events: none;
+            }
+            /* Narrow Mini: show the speaker button too; its volume row replaces the title row while open */
+            body.fluid.mini-vol.mini-mode #btn-volume-compact { display: flex !important; }
+            body.fluid.mini-vol.mini-mode .volume-popup { display: flex !important; top: calc(50% - 9px); bottom: auto; }
+            body.fluid.mini-vol.mini-mode .track-section { transition: opacity 0.22s ease; }
+            body.fluid.mini-vol.mini-mode.volume-open .track-section { opacity: 0; pointer-events: none; }
+            /* Slim (window under 74px tall): the top bar steps aside so the card gets the whole height */
+            body.fluid.slim .upcoming-bar { display: none; }
+            /* Tiny (Mini under 300px wide): shuffle/repeat drop out, padding tightens, volume stays */
+            body.fluid.tiny #btn-shuffle-compact,
+            body.fluid.tiny #btn-repeat-compact { display: none !important; }
+            body.fluid.tiny.mini-mode .miniplayer-card { padding: 8px; }
+            body.fluid.tiny.mini-mode .track-section { gap: 6px; }
+            /* The compact volume popup keeps its own fixed sizing */
+            body.fluid .volume-popup .icon-btn { width: 18px; height: 18px; }
+            body.fluid .volume-popup .icon-btn svg { scale: 1; }
+            /* Compact / Mini row: buttons scale, the title takes all the extra width */
+            body.fluid.compact-mode #btn-shuffle-compact,
+            body.fluid.compact-mode #btn-repeat-compact,
+            body.fluid.compact-mode #btn-volume-compact { width: calc(24px * var(--s, 1)); height: calc(24px * var(--s, 1)); }
+            body.fluid.compact-mode #btn-prev-compact,
+            body.fluid.compact-mode #btn-next-compact { width: calc(26px * var(--s, 1)); height: calc(26px * var(--s, 1)); }
+            body.fluid.compact-mode .compact-actions-cluster .window-actions .icon-btn { width: calc(20px * var(--s, 1)); height: calc(20px * var(--s, 1)); }
+            body.fluid.compact-mode .meta-container,
+            body.fluid.mini-mode .meta-container { max-width: none; }
+            /* Tall window: big album art on top, title and artist centered under it */
+            body.fluid.art-layout .track-section {
+                flex: 1 1 auto;
+                min-height: 0;
+                flex-direction: column;
+                justify-content: center;
+                gap: calc(8px * var(--s, 1));
+            }
+            body.fluid.art-layout .cover-container {
+                width: var(--art, 120px);
+                height: var(--art, 120px);
+                border-radius: 10px;
+            }
+            body.fluid.art-layout .meta-container {
+                flex: 0 0 auto;
+                width: 100%;
+                align-items: center;
+                text-align: center;
+            }
+            body.fluid.art-layout .meta-row { width: 100%; }
+            body.fluid.art-layout .track-title-wrapper { text-align: center; }
+            body.fluid.art-layout .track-artist { max-width: 100%; }
             .volume-toast.show {
                 opacity: 1;
                 transform: translate(-50%, -50%);
@@ -1606,10 +2669,20 @@
     function getMiniPlayerHTML() {
         return `
             <div id="ambient-bg"></div>
-            <!-- "Next up" strip (only shown when upcomingSong.js is installed) -->
+            <div class="player-surface" id="player-surface">
+            <!-- Queue list overlays the player window from the top bar's queue button -->
+            <div class="queue-panel" id="queue-panel">
+                <div class="queue-header">
+                    <span>Next up:</span>
+                    <span class="queue-count" id="queue-count"></span>
+                </div>
+                <div class="queue-list" id="queue-list"></div>
+            </div>
+            <!-- Top bar: queue button always; next-song text is optional -->
             <div class="upcoming-bar" id="upcoming-bar">
                 <span class="upcoming-label"><span class="upcoming-dot"></span>Next</span>
                 <span class="upcoming-text" id="upcoming-text"><span id="upcoming-title" class="upcoming-title"></span><span id="upcoming-artist" class="upcoming-artist"></span></span>
+                <button class="queue-btn" id="btn-queue" title="Queue">${ICONS.queue}</button>
             </div>
             <div class="miniplayer-card" id="miniplayer-card">
                 <!-- Standard Mode Header -->
@@ -1731,28 +2804,49 @@
                 <!-- Brief volume readout (used by Mini mode, which has no slider) -->
                 <div class="volume-toast" id="volume-toast"></div>
             </div>
+            </div>
         `;
     }
 
     function bindMiniPlayerEvents() {
-        if (!pipWindow) return;
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
+        subscribePlayerState((state, changedKeys) => {
+            if (changedKeys.has("currentTrack") || changedKeys.has("duration")) {
+                renderFullUI();
+            }
+            if (changedKeys.has("isPlaying")) {
+                updatePlayPauseButton();
+                if (state.isPlaying) startProgressLoop();
+            }
+            if ((changedKeys.has("progress") || changedKeys.has("duration")) && !isUserSeeking) {
+                renderProgressUI();
+            }
+            if (changedKeys.has("volume") && !isAdjustingVolume) updateVolumeUI();
+            if (changedKeys.has("shuffle") || changedKeys.has("repeat")) updateShuffleRepeatState();
+            if (changedKeys.has("queue")) {
+                updateUpcomingBar();
+                renderQueuePanel();
+            }
+        });
 
-        // Native Mouse Drag tracking fallback
+        // Manual window-drag fallback for the card and top bar.
         let isDragging = false;
         let startX = 0, startY = 0;
         const card = doc.getElementById("miniplayer-card");
+        const upcomingBar = doc.getElementById("upcoming-bar");
+        const dragRoots = [card, upcomingBar].filter(Boolean);
 
-        if (card) {
-            card.addEventListener("mousedown", (e) => {
+        if (dragRoots.length) {
+            dragRoots.forEach(root => listenPiP(root, "mousedown", (e) => {
                 if (e.button !== 0) return;
                 if (/** @type {HTMLElement} */(e.target).closest("button, input, a, .progress-bar-container")) return;
                 isDragging = true;
                 startX = e.screenX;
                 startY = e.screenY;
-            });
+            }));
 
-            pipWindow.addEventListener("mousemove", (e) => {
+            listenPiP(pipWindow, "mousemove", (e) => {
                 if (!isDragging) return;
                 const dx = e.screenX - startX;
                 const dy = e.screenY - startY;
@@ -1763,31 +2857,32 @@
                 } catch (err) {}
             });
 
-            pipWindow.addEventListener("mouseup", () => {
+            listenPiP(pipWindow, "mouseup", () => {
                 isDragging = false;
             });
         }
 
         // Mode Toggles
         const toggleMode = () => {
+            if (settings.dynamicResize) return; // the window size picks the layout
             const next = nextMode();
             if (next === currentMode) return; // only one usable mode
             currentMode = next;
-            localStorage.setItem(MODE_KEY, currentMode);
-            applyModeLayout(true);
+            saveMode(currentMode);
+            applyModeLayout();
         };
         // Mini mode has no cover, so it gets its own small mode button
-        doc.getElementById("btn-mode-mini")?.addEventListener("click", toggleMode);
+        listenPiP(doc.getElementById("btn-mode-mini"), "click", toggleMode);
 
         // Click the album art to switch modes (ignore clicks that were really a window drag)
         const coverContainer = doc.querySelector(".cover-container");
         let coverDownX = 0;
         let coverDownY = 0;
-        coverContainer?.addEventListener("mousedown", (e) => {
+        listenPiP(coverContainer, "mousedown", (e) => {
             coverDownX = e.screenX;
             coverDownY = e.screenY;
         });
-        coverContainer?.addEventListener("click", (e) => {
+        listenPiP(coverContainer, "click", (e) => {
             if (Math.abs(e.screenX - coverDownX) > 4 || Math.abs(e.screenY - coverDownY) > 4) return;
             toggleMode();
         });
@@ -1797,11 +2892,11 @@
         const bindLink = (root, selector, getUri) => {
             let downX = 0;
             let downY = 0;
-            root?.addEventListener("mousedown", (e) => {
+            listenPiP(root, "mousedown", (e) => {
                 downX = e.screenX;
                 downY = e.screenY;
             });
-            root?.addEventListener("click", (e) => {
+            listenPiP(root, "click", (e) => {
                 if (!settings.clickToOpen) return;
                 if (Math.abs(e.screenX - downX) > 4 || Math.abs(e.screenY - downY) > 4) return;
                 const el = /** @type {HTMLElement} */ (e.target).closest(selector);
@@ -1809,50 +2904,111 @@
                 if (uri) openInSpotify(uri);
             });
         };
-        bindLink(doc.getElementById("title-wrapper"), ".track-title.linkable, .track-title-text.linkable", () => currentAlbumUri);
+        bindLink(doc.getElementById("title-wrapper"), ".track-title-text.linkable", () => currentAlbumUri);
         bindLink(doc.getElementById("title-wrapper"), ".artist-link.linkable", (el) => el.dataset.uri || "");
         bindLink(doc.getElementById("track-artist"), ".artist-link.linkable", (el) => el.dataset.uri || "");
 
+        // Queue button in the top bar: show/hide the queue list.
+        const queueButton = doc.getElementById("btn-queue");
+        listenPiP(queueButton, "click", () => {
+            queueOpen = !queueOpen;
+            if (queueOpen) syncPlayerState(["queue"]);
+            applyQueueLayout();
+        });
+        listenPiP(queueButton, "keydown", (e) => {
+            if (e.code === "Space" || e.key === " ") e.preventDefault();
+        });
+        listenPiP(queueButton, "keyup", (e) => {
+            if (e.code === "Space" || e.key === " ") e.preventDefault();
+        });
+        listenPiP(doc.getElementById("queue-panel"), "contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+        const scrollQueueFromWheel = (e) => {
+            if (!queueOpen || e.deltaY === 0) return;
+            const list = doc.getElementById("queue-list");
+            if (!list) return;
+
+            const lineHeight = parseFloat(pipWindow.getComputedStyle(list).lineHeight) || 16;
+            const delta = e.deltaMode === WheelEvent.DOM_DELTA_LINE
+                ? e.deltaY * lineHeight
+                : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
+                    ? e.deltaY * list.clientHeight
+                    : e.deltaY;
+            list.scrollTop += delta;
+            e.preventDefault();
+            e.stopPropagation();
+        };
+        listenPiP(upcomingBar, "wheel", scrollQueueFromWheel, { passive: false });
+        listenPiP(pipWindow, "wheel", (e) => {
+            if (upcomingBar?.contains(e.target)) return;
+            scrollQueueFromWheel(e);
+        }, { capture: true, passive: false });
+
+        // Close the queue's three-dots menu on an outside click, Escape, or scrolling the list
+        listenPiP(doc, "mousedown", (e) => {
+            if (!queueMenuEl) return;
+            if (/** @type {HTMLElement} */ (e.target).closest(".queue-menu, .queue-more")) return;
+            closeQueueMenu();
+        });
+        listenPiP(doc, "keydown", (e) => {
+            if (e.key === "Escape") closeQueueMenu();
+        });
+        listenPiP(doc.getElementById("queue-list"), "scroll", closeQueueMenu);
+
         // Close Buttons
-        doc.getElementById("btn-close")?.addEventListener("click", () => closeMiniPlayer());
-        doc.getElementById("btn-close-compact")?.addEventListener("click", () => closeMiniPlayer());
+        listenPiP(doc.getElementById("btn-close"), "click", () => closeMiniPlayer());
+        listenPiP(doc.getElementById("btn-close-compact"), "click", () => closeMiniPlayer());
 
         // Play / Pause
         const handlePlayPause = () => Spicetify.Player.togglePlay();
-        doc.getElementById("btn-play-pause")?.addEventListener("click", handlePlayPause);
-        doc.getElementById("btn-play-pause-compact")?.addEventListener("click", handlePlayPause);
+        listenPiP(doc.getElementById("btn-play-pause"), "click", handlePlayPause);
+        listenPiP(doc.getElementById("btn-play-pause-compact"), "click", handlePlayPause);
 
         // Prev & Next
         const handlePrev = () => Spicetify.Player.back();
         const handleNext = () => Spicetify.Player.next();
-        doc.getElementById("btn-prev")?.addEventListener("click", handlePrev);
-        doc.getElementById("btn-prev-compact")?.addEventListener("click", handlePrev);
-        doc.getElementById("btn-next")?.addEventListener("click", handleNext);
-        doc.getElementById("btn-next-compact")?.addEventListener("click", handleNext);
+        listenPiP(doc.getElementById("btn-prev"), "click", handlePrev);
+        listenPiP(doc.getElementById("btn-prev-compact"), "click", handlePrev);
+        listenPiP(doc.getElementById("btn-next"), "click", handleNext);
+        listenPiP(doc.getElementById("btn-next-compact"), "click", handleNext);
 
-        // Shuffle & Repeat
         // Shuffle & Repeat (standard + compact buttons)
         ["btn-shuffle", "btn-shuffle-compact"].forEach(id => {
-            doc.getElementById(id)?.addEventListener("click", () => {
+            listenPiP(doc.getElementById(id), "click", () => {
                 Spicetify.Player.toggleShuffle();
-                safeSetTimeout(updateShuffleRepeatState, 100);
+                safeSetTimeout(() => syncPlayerState(["shuffle"]), 100);
             });
         });
         ["btn-repeat", "btn-repeat-compact"].forEach(id => {
-            doc.getElementById(id)?.addEventListener("click", () => {
+            listenPiP(doc.getElementById(id), "click", () => {
                 Spicetify.Player.toggleRepeat();
-                safeSetTimeout(updateShuffleRepeatState, 100);
+                safeSetTimeout(() => syncPlayerState(["repeat"]), 100);
             });
         });
 
         // Progress Scrubber
         const progressSlider = doc.getElementById("progress-slider");
         if (progressSlider) {
-            progressSlider.addEventListener("mousedown", () => {
+            const resetUserSeeking = () => {
+                if (!isUserSeeking) return;
+                isUserSeeking = false;
+                startProgressLoop();
+            };
+            listenPiP(progressSlider, "pointerdown", (e) => {
                 isUserSeeking = true;
+                try { progressSlider.setPointerCapture(e.pointerId); } catch (err) {}
             });
-            progressSlider.addEventListener("input", (e) => {
-                const duration = Spicetify.Player.getDuration() || 0;
+            listenPiP(progressSlider, "pointerup", resetUserSeeking);
+            listenPiP(progressSlider, "pointercancel", resetUserSeeking);
+            listenPiP(progressSlider, "lostpointercapture", resetUserSeeking);
+            listenPiP(progressSlider, "blur", resetUserSeeking);
+            listenPiP(doc, "pointerup", resetUserSeeking);
+            listenPiP(doc, "pointercancel", resetUserSeeking);
+            listenPiP(pipWindow, "blur", resetUserSeeking);
+            listenPiP(progressSlider, "input", (e) => {
+                const duration = playerState.duration;
                 // @ts-ignore
                 const pct = (e.target.value / 1000);
                 const currentMs = duration * pct;
@@ -1866,11 +3022,12 @@
                 }
                 updateSliderFill(progressSlider, pct * 100);
             });
-            progressSlider.addEventListener("change", (e) => {
+            listenPiP(progressSlider, "change", (e) => {
                 // @ts-ignore
                 const pct = (e.target.value / 1000);
                 Spicetify.Player.seek(pct);
                 isUserSeeking = false;
+                updatePlayerState({ progress: pct * playerState.duration });
                 startProgressLoop();
             });
         }
@@ -1893,51 +3050,64 @@
             volumePopup.classList.toggle("open", open);
             doc.body.classList.toggle("volume-open", open);
             volumeTrigger?.classList.toggle("active", open);
+            doc.getElementById("btn-volume-icon")?.classList.toggle("active", open);
             if (open) {
-                updateVolumeUI(Spicetify.Player.getVolume());
+                updateVolumeUI();
                 resetVolumePopupTimer();
             } else {
                 safeClearTimeout(volumePopupTimer);
             }
         };
 
-        volumeTrigger?.addEventListener("click", () => setVolumePopup(!isVolumePopupOpen()));
+        listenPiP(volumeTrigger, "click", () => setVolumePopup(!isVolumePopupOpen()));
 
         // Any interaction inside the popup counts as activity and restarts the 2s timer
-        volumePopup?.addEventListener("pointermove", () => {
+        listenPiP(volumePopup, "pointermove", () => {
             if (isVolumePopupOpen()) resetVolumePopupTimer();
         });
 
         // Clicking anywhere outside the popup closes it
-        doc.addEventListener("mousedown", (e) => {
+        listenPiP(doc, "mousedown", (e) => {
             if (!isVolumePopupOpen()) return;
             const target = /** @type {HTMLElement} */ (e.target);
-            if (target.closest("#volume-popup, #btn-volume-compact")) return;
+            if (target.closest("#volume-popup, #btn-volume-compact, #btn-volume-icon")) return;
             setVolumePopup(false);
         });
 
         ["volume-slider", "volume-slider-compact"].forEach(id => {
             const slider = doc.getElementById(id);
             if (!slider) return;
-            slider.addEventListener("pointerdown", () => { isAdjustingVolume = true; });
-            slider.addEventListener("input", (e) => {
+            listenPiP(slider, "pointerdown", (e) => {
+                isAdjustingVolume = true;
+                try { slider.setPointerCapture(e.pointerId); } catch (err) {}
+            });
+            const endVolumeAdjustment = () => { isAdjustingVolume = false; };
+            listenPiP(slider, "pointerup", endVolumeAdjustment);
+            listenPiP(slider, "pointercancel", endVolumeAdjustment);
+            listenPiP(slider, "lostpointercapture", endVolumeAdjustment);
+            listenPiP(slider, "input", (e) => {
                 // @ts-ignore
                 const val = parseFloat(e.target.value) / 100;
                 Spicetify.Player.setVolume(val);
-                updateVolumeUI(val);
+                updatePlayerState({ volume: val });
+                updateVolumeUI();
                 if (isVolumePopupOpen()) resetVolumePopupTimer();
             });
         });
-        doc.addEventListener("pointerup", () => { isAdjustingVolume = false; });
+        listenPiP(doc, "pointerup", () => { isAdjustingVolume = false; });
+        listenPiP(doc, "pointercancel", () => { isAdjustingVolume = false; });
+        listenPiP(pipWindow, "blur", () => { isAdjustingVolume = false; });
 
         ["btn-volume-icon", "btn-volume-icon-compact"].forEach(id => {
-            doc.getElementById(id)?.addEventListener("click", () => {
+            listenPiP(doc.getElementById(id), "click", () => {
+                // Narrow window: the speaker opens the volume row (like Compact) instead of muting
+                if (id === "btn-volume-icon" && doc.body.classList.contains("vol-icon-only")) {
+                    setVolumePopup(!isVolumePopupOpen());
+                    return;
+                }
                 Spicetify.Player.toggleMute();
                 if (isVolumePopupOpen()) resetVolumePopupTimer();
-                safeSetTimeout(() => {
-                    const vol = Spicetify.Player.getVolume();
-                    updateVolumeUI(vol);
-                }, 100);
+                safeSetTimeout(() => syncPlayerState(["volume"]), 100);
             });
         });
 
@@ -1957,7 +3127,7 @@
             let lastWheelSeekMs = null;
             let lastWheelSeekAt = 0;
             let wheelSeekTimer;
-            card.addEventListener("wheel", (e) => {
+            listenPiP(card, "wheel", (e) => {
                 if (!settings.scrollAdjust) return;
                 e.preventDefault();
                 if (e.deltaY === 0) return;
@@ -1965,17 +3135,18 @@
                 const target = /** @type {HTMLElement} */ (e.target);
 
                 if (target.closest("#progress-section")) {
-                    const duration = Spicetify.Player.getDuration() || 0;
+                    const duration = playerState.duration;
                     if (!duration) return;
                     const now = Date.now();
                     // Chain rapid scrolls from the last target so steps stack up before the seek lands
                     const base = (lastWheelSeekMs !== null && now - lastWheelSeekAt < 600)
                         ? lastWheelSeekMs
-                        : (Spicetify.Player.getProgress() || 0);
+                        : playerState.progress;
                     const next = Math.min(Math.max(duration - 1000, 0), Math.max(0, base + dir * settings.seekStep * 1000));
                     lastWheelSeekMs = next;
                     lastWheelSeekAt = now;
                     Spicetify.Player.seek(next / duration);
+                    updatePlayerState({ progress: next });
 
                     // Reflect immediately and hold the tick off briefly so it doesn't flicker back
                     isUserSeeking = true;
@@ -1999,12 +3170,12 @@
                         updateSliderFill(slider, (next / duration) * 100);
                     }
                 } else {
-                    const current = Spicetify.Player.getVolume() || 0;
+                    const current = playerState.volume || 0;
                     const next = Math.min(1, Math.max(0, Math.round((current + dir * settings.volumeStep / 100) * 100) / 100));
                     Spicetify.Player.setVolume(next);
-                    updateVolumeUI(next);
+                    updatePlayerState({ volume: next });
                     // Compact has no visible slider, so show the volume row; Mini shows a brief readout
-                    if (currentMode === "compact") {
+                    if (currentMode === "compact" || doc.body.classList.contains("vol-icon-only") || doc.body.classList.contains("mini-vol")) {
                         if (!isVolumePopupOpen()) setVolumePopup(true);
                         else resetVolumePopupTimer();
                     } else if (currentMode === "mini") {
@@ -2038,12 +3209,12 @@
                 safeClearTimeout(fadeTimer);
                 doc.body.classList.remove("idle");
             };
-            root.addEventListener("mouseenter", wake);
+            listenPiP(root, "mouseenter", wake);
             // Safety net: any movement over the window counts as hovering, even if mouseenter was missed
-            doc.addEventListener("mousemove", () => {
+            listenPiP(doc, "mousemove", () => {
                 if (!mouseInside || doc.body.classList.contains("idle")) wake();
             });
-            root.addEventListener("mouseleave", (e) => {
+            listenPiP(root, "mouseleave", (e) => {
                 mouseInside = false;
                 // Native drag areas (the next-up strip, empty card space) don't send mouse events, so moving
                 // onto one looks like leaving the window. If the pointer "left" while still inside the window's
@@ -2058,14 +3229,14 @@
         }
 
         // Save window position only when dragging/moving finishes or window loses focus
-        pipWindow.addEventListener("mouseup", saveWindowPosition);
-        pipWindow.addEventListener("blur", saveWindowPosition);
+        listenPiP(pipWindow, "mouseup", saveWindowPosition);
+        listenPiP(pipWindow, "blur", saveWindowPosition);
 
         // Resume visual progress loop immediately when PiP document becomes visible
-        doc.addEventListener("visibilitychange", () => {
+        listenPiP(doc, "visibilitychange", () => {
             if (!doc.hidden) {
                 updateProgressVisuals();
-                if (Spicetify.Player.isPlaying()) {
+                if (playerState.isPlaying) {
                     startProgressLoop();
                 }
             }
@@ -2074,8 +3245,8 @@
         applyModeLayout();
     }
 
-    function applyModeLayout(redetect = false) {
-        if (!pipWindow) return;
+    function applyModeLayout() {
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         // Popup only exists in compact mode; close it when the layout changes
         doc.getElementById("volume-popup")?.classList.remove("open");
@@ -2084,9 +3255,6 @@
         // Compact and Mini share the compact layout; Mini then strips it down further
         doc.body.classList.toggle("compact-mode", currentMode !== "standard");
         doc.body.classList.toggle("mini-mode", currentMode === "mini");
-        // Re-check for upcomingSong.js on mode switches (a user gesture, so the window may be resized)
-        if (redetect) upcomingBarEnabled = shouldShowUpcoming();
-        doc.body.classList.toggle("has-upcoming", upcomingBarEnabled);
         lastUpcomingKey = null;
         updateUpcomingBar();
         // The cover's hover icon / Mini button show the mode you'd switch to
@@ -2097,7 +3265,34 @@
     }
 
     function resizePiPWindowToMode() {
-        if (!pipWindow || pipWindow.closed) return;
+        if (!isPiPWindowOpen()) return;
+
+        // Dynamic resizing: the window size belongs to the user. The one exception is the queue, which
+        // needs some height, so the window grows while it's open and returns to its old size afterwards.
+        if (settings.dynamicResize) {
+            const state = fluidState();
+            const iw = pipWindow.innerWidth;
+            const ih = pipWindow.innerHeight;
+            try {
+                if (queueOpen) {
+                    if (!state.prevSize) state.prevSize = { w: iw, h: ih };
+                    if (ih < FLUID_QUEUE_MIN_HEIGHT) {
+                        pipWindow.resizeTo(iw + pipWindowFrameWidth, FLUID_QUEUE_MIN_HEIGHT + pipWindowFrameHeight);
+                    }
+                } else if (state.prevSize) {
+                    const prev = state.prevSize;
+                    state.prevSize = null;
+                    // Only restore if the user didn't resize the window themselves while the queue was open
+                    if (Math.abs(ih - FLUID_QUEUE_MIN_HEIGHT) <= 2) {
+                        pipWindow.resizeTo(prev.w + pipWindowFrameWidth, prev.h + pipWindowFrameHeight);
+                    }
+                }
+            } catch (err) {
+                console.warn("[MiniPlayer] Unable to resize the window:", err);
+            }
+            if (!queueOpen) applyFluidLayout(true);
+            return;
+        }
 
         const { width: targetWidth, height: targetHeight } = getTargetSize();
         if (pipWindow.innerWidth === targetWidth && pipWindow.innerHeight === targetHeight) return;
@@ -2113,7 +3308,7 @@
     }
 
     function updateMarqueeEffect(force = false) {
-        if (!pipWindow || pipWindow.closed) return;
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         const wrapper = doc.getElementById("title-wrapper");
         const track = doc.getElementById("marquee-track");
@@ -2136,7 +3331,7 @@
         const textWidth = titleEl.getBoundingClientRect().width;
         if (textWidth - availableWidth > 4) {
             const gap = 40; // keep in sync with .marquee-track.marquee .track-title margin-right
-            const clone = titleEl.cloneNode(true);
+            const clone = /** @type {HTMLElement} */ (titleEl.cloneNode(true));
             clone.id = "track-title-clone";
             clone.setAttribute("aria-hidden", "true");
             track.appendChild(clone);
@@ -2150,7 +3345,7 @@
     }
 
     function renderFullUI() {
-        if (!pipWindow) return;
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         const meta = getTrackMetadata();
 
@@ -2168,7 +3363,7 @@
             if (currentAlbumUri) titleSpan.dataset.uri = currentAlbumUri;
             titleEl.appendChild(titleSpan);
 
-            // In Mini Mode, combine Title and Artist on the same line like upcomingSong
+            // In Mini Mode, combine Title and Artist on the same line.
             if (currentMode === "mini" && meta.artist) {
                 const artistInline = doc.createElement("span");
                 artistInline.className = "track-artist-inline";
@@ -2210,12 +3405,16 @@
         // Cover Art & Ambient BG
         const coverEl = doc.getElementById("cover-img");
         const ambientBg = doc.getElementById("ambient-bg");
-        if (coverEl && meta.cover) {
-            // @ts-ignore
-            coverEl.src = meta.cover;
+        if (coverEl) {
+            if (meta.cover) {
+                // @ts-ignore
+                coverEl.src = meta.cover;
+            } else {
+                coverEl.removeAttribute("src");
+            }
         }
-        if (ambientBg && meta.cover) {
-            ambientBg.style.backgroundImage = `url("${meta.cover}")`;
+        if (ambientBg) {
+            ambientBg.style.backgroundImage = meta.cover ? `url("${meta.cover}")` : "none";
         }
 
         // Duration Label
@@ -2223,22 +3422,22 @@
         if (durationEl) {
             durationEl.textContent = formatTime(meta.duration);
         }
+        renderProgressUI();
 
         // Controls
         updatePlayPauseButton();
         updateShuffleRepeatState();
 
         // Volume
-        const vol = Spicetify.Player.getVolume();
-        updateVolumeUI(vol);
+        updateVolumeUI();
     }
 
     function updatePlayPauseButton() {
-        if (!pipWindow) return;
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         const btnStandard = doc.getElementById("btn-play-pause");
         const btnCompact = doc.getElementById("btn-play-pause-compact");
-        const isPlaying = Spicetify.Player.isPlaying();
+        const isPlaying = playerState.isPlaying;
         const icon = isPlaying ? ICONS.pause : ICONS.play;
 
         if (btnStandard) {
@@ -2252,28 +3451,37 @@
     }
 
     function updateShuffleRepeatState() {
-        if (!pipWindow) return;
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
-        const data = Spicetify.Player.data;
-        if (data) {
-            const isShuffle = !!data.shuffle;
-            const isRepeat = data.repeat > 0;
-            ["btn-shuffle", "btn-shuffle-compact"].forEach(id => {
-                doc.getElementById(id)?.classList.toggle("active", isShuffle);
-            });
-            ["btn-repeat", "btn-repeat-compact"].forEach(id => {
-                doc.getElementById(id)?.classList.toggle("active", isRepeat);
-            });
-        }
+        const isShuffle = playerState.shuffle;
+        const repeatState = playerState.repeat;
+        const isRepeat = repeatState > 0;
+        const isRepeatOne = repeatState === 2;
+        const repeatTitle = repeatState === 0
+            ? "Enable Repeat"
+            : repeatState === 1
+                ? "Enable Repeat One"
+                : "Disable Repeat One";
+        ["btn-shuffle", "btn-shuffle-compact"].forEach(id => {
+            const button = doc.getElementById(id);
+            if (!button) return;
+            button.classList.toggle("active", isShuffle);
+            button.title = isShuffle ? "Disable Shuffle" : "Enable Shuffle";
+        });
+        ["btn-repeat", "btn-repeat-compact"].forEach(id => {
+            const button = doc.getElementById(id);
+            if (!button) return;
+            button.classList.toggle("active", isRepeat);
+            button.classList.toggle("repeat-one", isRepeatOne);
+            button.title = repeatTitle;
+        });
     }
 
-    function updateVolumeUI(vol) {
-        if (!pipWindow) return;
+    function updateVolumeUI() {
+        if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
-        const slider = doc.getElementById("volume-slider");
-        const iconBtn = doc.getElementById("btn-volume-icon");
 
-        const pct = Math.round((vol || 0) * 100);
+        const pct = Math.round((playerState.volume || 0) * 100);
         ["volume-slider", "volume-slider-compact"].forEach(id => {
             const s = doc.getElementById(id);
             if (!s) return;
@@ -2297,11 +3505,16 @@
     }
 
     function updateProgressVisuals() {
-        if (!pipWindow || pipWindow.closed || isUserSeeking) return;
+        if (!isPiPWindowOpen() || isUserSeeking) return;
+        syncPlayerState(["progress"]);
+    }
+
+    function renderProgressUI() {
+        if (!isPiPWindowOpen() || isUserSeeking) return;
         const doc = pipWindow.document;
 
-        const currentMs = Spicetify.Player.getProgress() || 0;
-        const durationMs = Spicetify.Player.getDuration() || 0;
+        const currentMs = playerState.progress || 0;
+        const durationMs = playerState.duration || 0;
 
         const timeCurrent = doc.getElementById("time-current");
         const slider = doc.getElementById("progress-slider");
@@ -2327,12 +3540,13 @@
     }
 
     function startProgressLoop() {
-        if (rafId) return;
-        if (!pipWindow || pipWindow.closed) return;
+        if (rafId !== null) return;
+        const resources = pipResources;
+        if (!isPiPWindowOpen() || !resources) return;
 
         const loop = () => {
-            if (!pipWindow || pipWindow.closed) {
-                rafId = null;
+            rafId = null;
+            if (!isPiPWindowOpen()) {
                 return;
             }
 
@@ -2340,49 +3554,34 @@
                 updateProgressVisuals();
             }
 
-            if (Spicetify.Player.isPlaying()) {
-                rafId = pipWindow.requestAnimationFrame(loop);
-            } else {
-                rafId = null;
+            if (playerState.isPlaying) {
+                rafId = resources.requestAnimationFrame(loop);
             }
         };
 
-        rafId = pipWindow.requestAnimationFrame(loop);
+        rafId = resources.requestAnimationFrame(loop);
     }
 
-    function slowBackgroundTick() {
-        if (!pipWindow || pipWindow.closed) return;
-        saveWindowPosition();
-        updateUpcomingBar();
-        // Fallback progress tick when document is hidden or audio is paused
-        if (pipWindow.document.hidden || !Spicetify.Player.isPlaying()) {
-            updateProgressVisuals();
-        }
-        // Keep the popup in sync if volume is changed elsewhere (e.g. main Spotify window)
-        if (!isAdjustingVolume && pipWindow.document.getElementById("volume-popup")?.classList.contains("open")) {
-            updateVolumeUI(Spicetify.Player.getVolume());
-        }
+    function syncPlayerStateTick() {
+        if (!isPiPWindowOpen()) return;
+        syncPlayerState(["currentTrack", "isPlaying", "duration", "volume", "shuffle", "repeat"]);
+        if (pipWindow.document.hidden || !playerState.isPlaying) updateProgressVisuals();
     }
 
     // Attach Spicetify Event Listeners for live sync
     Spicetify.Player.addEventListener("songchange", () => {
-        if (pipWindow && !pipWindow.closed) {
+        if (isPiPWindowOpen()) {
             lastFormattedTime = "";
             lastSliderValue = -1;
-            renderFullUI();
-            updateUpcomingBar();
+            syncPlayerState(["currentTrack", "isPlaying", "progress", "duration", "volume", "shuffle", "repeat"]);
+            safeSetTimeout(() => syncPlayerState(["queue"]), 400); // the queue settles just after the song changes
             startProgressLoop();
         }
     });
 
     Spicetify.Player.addEventListener("onplaypause", () => {
-        if (pipWindow && !pipWindow.closed) {
-            updatePlayPauseButton();
-            if (Spicetify.Player.isPlaying()) {
-                startProgressLoop();
-            } else {
-                updateProgressVisuals();
-            }
+        if (isPiPWindowOpen()) {
+            syncPlayerState(["isPlaying", "progress"]);
         }
     });
 
@@ -2391,7 +3590,7 @@
         // 1. Topbar Button: opens the mini player's settings (the playbar button / Alt+M toggle the player)
         if (Spicetify.Topbar?.Button) {
             try {
-                topbarButton = new Spicetify.Topbar.Button(
+                new Spicetify.Topbar.Button(
                     "Mini Player Settings",
                     ICONS.gear,
                     () => openSettings()
@@ -2414,7 +3613,7 @@
                 btn.setAttribute("aria-label", "Mini Player (Alt+M)");
                 btn.style.background = "transparent";
                 btn.style.border = "none";
-                btn.style.color = "#b3b3b3";
+                btn.style.color = isPiPWindowOpen() ? "#1db954" : "#b3b3b3";
                 btn.style.cursor = "pointer";
                 btn.style.display = "inline-flex";
                 btn.style.alignItems = "center";
@@ -2433,7 +3632,7 @@
 
                 btn.onmouseenter = () => btn.style.color = "#ffffff";
                 btn.onmouseleave = () => {
-                    btn.style.color = (pipWindow && !pipWindow.closed) ? "#1db954" : "#b3b3b3";
+                    btn.style.color = isPiPWindowOpen() ? "#1db954" : "#b3b3b3";
                 };
                 btn.onclick = (e) => {
                     e.preventDefault();
@@ -2472,6 +3671,7 @@
                         rightControls.appendChild(btn);
                     }
                 }
+                updateButtonStates(isPiPWindowOpen());
                 return true;
             };
 
