@@ -13,7 +13,17 @@
     let pipWindowFrameWidth = 0;
     let pipWindowFrameHeight = 0;
     let rafId = null;
+    let progressTimerId = null;
     let isOpening = false;
+    let lyricsObserver = null;
+    let lyricsPollTimerId = null;
+    let lyricsRefreshTimerId = null;
+    let lyricsSource = null;
+    let lastLyricsSnapshotKey = "";
+    let lyricsTextMode = "original";
+    let lyricsRomanizationAvailable = false;
+    // Re-evaluates which mini player launcher the playback bar shows (assigned in registerButtons)
+    let syncPlaybarButtons = () => {};
     let pipResources = null;
     const playerState = {
         currentTrack: null,
@@ -26,9 +36,15 @@
         queue: []
     };
     const playerStateListeners = new Set();
-    const PLAYER_STATE_SYNC_MS = 1000;
+    const PLAYER_STATE_SYNC_MS = 2500;
     const QUEUE_STATE_SYNC_MS = 1500;
     const WINDOW_POSITION_SYNC_MS = 2500;
+    const LYRICS_TEXT_MODES = ["original", "romanized", "both"];
+    const LYRICS_TEXT_MODE_LABELS = {
+        original: "Original",
+        romanized: "Romanized",
+        both: "Both"
+    };
     let isUserSeeking = false;
     let isAdjustingVolume = false;
     let lastFormattedTime = "";
@@ -36,6 +52,7 @@
     let lastMarqueeKey = "";
     // Experimental dynamic resizing state (see applyFluidLayout)
     const fluid = { win: null, sig: "", prevSize: null };
+    let lastProgressPaint = 0; // throttles the progress loop (see startProgressLoop)
     // Current layout mode ("standard" | "compact" | "mini") is set up below, after settings load
 
     function isPiPWindowOpen() {
@@ -163,10 +180,12 @@
     }
 
     function cleanupPiPResources() {
+        stopLyricsAdapter();
         const resources = pipResources;
         pipResources = null;
         resources?.cleanup();
         rafId = null;
+        progressTimerId = null;
         isUserSeeking = false;
         isAdjustingVolume = false;
         lastUpcomingKey = null;
@@ -175,6 +194,7 @@
         queueMenuEl = null;
         queueMenuDisposers = [];
         queueRenderDisposers = [];
+        queueRenderGeneration++;
         lastFormattedTime = "";
         lastSliderValue = -1;
         lastMarqueeKey = "";
@@ -212,6 +232,7 @@
         clickToOpen: true,       // click title/artist to open album/artist page
         dynamicResize: false,    // experimental: free window resizing, the layout adapts to the size
         showUpcoming: true,      // Show the next playback-queue item in the top bar
+        replaceNative: true,     // Spotify's own mini player button opens this player instead
         modes: { standard: true, compact: true, mini: true }  // which modes you can switch between
     };
 
@@ -240,7 +261,7 @@
         s.idleDelay = clampNum(s.idleDelay, 200, 5000, DEFAULT_SETTINGS.idleDelay);
         s.seekStep = clampNum(s.seekStep, 1, 30, DEFAULT_SETTINGS.seekStep);
         s.volumeStep = clampNum(s.volumeStep, 1, 20, DEFAULT_SETTINGS.volumeStep);
-        ["autoFade", "rememberPosition", "scrollAdjust", "clickToOpen", "showUpcoming", "dynamicResize"].forEach(k => { s[k] = !!s[k]; });
+        ["autoFade", "rememberPosition", "scrollAdjust", "clickToOpen", "showUpcoming", "replaceNative", "dynamicResize"].forEach(k => { s[k] = !!s[k]; });
         const savedModes = (saved && typeof saved.modes === "object" && saved.modes) || {};
         s.modes = {
             standard: savedModes.standard !== false,
@@ -316,6 +337,7 @@
     let queueMenuEl = null;
     let queueMenuDisposers = [];
     let queueRenderDisposers = [];
+    let queueRenderGeneration = 0;
     // Fixed Dimensions: strictly locked to prevent expansion/stretching
     const STANDARD_WIDTH = 360;
     const STANDARD_HEIGHT = 185;
@@ -329,10 +351,14 @@
     // Keep the queue window at 75% of its original 260px panel plus the 26px top bar.
     const QUEUE_PANEL_HEIGHT = Math.round((260 + UPCOMING_BAR_HEIGHT) * 0.75) - UPCOMING_BAR_HEIGHT;
     // Experimental dynamic resizing
+    const PROGRESS_STEPS = 10000; // progress slider resolution: about 1 s per step even on a 3 hour episode
     const SIZE_KEY = "spicetify_miniplayer_size";
     const FLUID_MIN_WIDTH = 240;
     const FLUID_MIN_HEIGHT = 51;
     const FLUID_QUEUE_MIN_HEIGHT = QUEUE_PANEL_HEIGHT + UPCOMING_BAR_HEIGHT; // window grows to this while the queue is open
+    const FLUID_MAX_WIDTH = 1536;  // Chrome's ceiling for a Document PiP window
+    const FLUID_MAX_HEIGHT = 863;
+    const FLUID_SHRINK_FACTOR = 1.25; // the shrink button appears once the window is this much bigger than the biggest enabled mode
     const FLUID_ART_MIN_HEIGHT = 290; // card height above which the big album-art layout kicks in
 
     // SVG Icons
@@ -340,6 +366,7 @@
         more: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><circle cx="2.5" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13.5" cy="8" r="1.5"/></svg>`,
         queue: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M15 15H1v-1.5h14V15zm0-4.5H1V9h14v1.5zm-14-7A2.5 2.5 0 0 1 3.5 1h9a2.5 2.5 0 0 1 0 5h-9A2.5 2.5 0 0 1 1 3.5zm2.5-1a1 1 0 0 0 0 2h9a1 1 0 1 0 0-2h-9z"/></svg>`,
         mini: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M1.5 5h13A1.5 1.5 0 0 1 16 6.5v3a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 9.5v-3A1.5 1.5 0 0 1 1.5 5zm0 1.5a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5V7a.5.5 0 0 0-.5-.5h-13z"/></svg>`,
+        shrink: `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 10h4v4M14 6h-4V2M10 6l4-4M6 10l-4 4"/></svg>`,
         gear: `<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path fill-rule="evenodd" d="M8 3.8a4.2 4.2 0 1 0 0 8.4 4.2 4.2 0 0 0 0-8.4zM8 6.2a1.8 1.8 0 1 1 0 3.6 1.8 1.8 0 0 1 0-3.6z"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(45 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(90 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(135 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(180 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(225 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(270 8 8)"/><rect x="6.9" y="0.8" width="2.2" height="3.2" rx="0.6" transform="rotate(315 8 8)"/></svg>`,
         miniplayer: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 21h10"/><rect width="20" height="14" x="2" y="3" rx="2"/></svg>`,
         play: `<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M3 1.713a.7.7 0 0 1 1.05-.607l10.89 6.288a.7.7 0 0 1 0 1.212L4.05 14.894A.7.7 0 0 1 3 14.288V1.713z"/></svg>`,
@@ -352,7 +379,8 @@
         volumeMute: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.86 5.47a.75.75 0 0 0-1.061 0l-1.47 1.47-1.47-1.47A.75.75 0 0 0 8.8 6.53L10.269 8l-1.47 1.47a.75.75 0 1 0 1.06 1.06l1.47-1.47 1.47 1.47a.75.75 0 0 0 1.06-1.06L12.39 8l1.47-1.47a.75.75 0 0 0 0-1.06zM9.741.85a.75.75 0 0 1 .375.65v13a.75.75 0 0 1-1.125.65l-6.925-4H0V4.85h2.066l6.925-4a.75.75 0 0 1 .75 0z"/></svg>`,
         compact: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M1.5 1h13A1.5 1.5 0 0 1 16 2.5v11a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 13.5v-11A1.5 1.5 0 0 1 1.5 1zm0 1.5a.5.5 0 0 0-.5.5v2h14V3a.5.5 0 0 0-.5-.5h-13zM15 6H1v7.5a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5V6z"/></svg>`,
         expand: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M2.5 1A1.5 1.5 0 0 0 1 2.5v11A1.5 1.5 0 0 0 2.5 15h11a1.5 1.5 0 0 0 1.5-1.5v-11A1.5 1.5 0 0 0 13.5 1h-11zm0 1.5h11a.5.5 0 0 1 .5.5v11a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5z"/></svg>`,
-        close: `<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8 2.146 2.854z"/></svg>`
+        close: `<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8 2.146 2.854z"/></svg>`,
+        lyrics: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M2 2.75A.75.75 0 0 1 2.75 2h10.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 2.75zm0 4A.75.75 0 0 1 2.75 6h10.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 6.75zm0 4A.75.75 0 0 1 2.75 10h7.5a.75.75 0 0 1 0 1.5h-7.5A.75.75 0 0 1 2 10.75z"/></svg>`
     };
 
     // The icon shown for each mode (the cover / mode button shows the mode you'd switch TO)
@@ -360,6 +388,7 @@
 
     // Pushes current settings into an open mini player window
     function applySettings() {
+        syncPlaybarButtons(); // "Replace Spotify's mini player" applies even when our window is closed
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         doc.documentElement.style.setProperty("--idle-opacity", String(settings.idleOpacity));
@@ -625,6 +654,14 @@
             slider("volumeStep", 1, 20, 1, v => v, v => v, v => `${v}%`));
         row("Click title / artist to open", "Opens the album or artist page in Spotify.", toggle("clickToOpen"));
 
+        section("Spotify integration");
+        row("Replace Spotify's mini player",
+            "Spotify's own mini player button opens this player instead. Turn off to restore Spotify's native mini player. "
+            + (findNativeMiniplayerButtons().length > 0
+                ? "Spotify's button detected."
+                : "Spotify's button wasn't found (Spotify may have changed it), so this extension's own playbar button is shown instead."),
+            toggle("replaceNative"));
+
         section("Top bar");
         row("Show next song",
             "Shows the first upcoming track from the playback queue in the top bar.",
@@ -632,7 +669,7 @@
 
         section("Experimental");
         row("Dynamic resizing",
-            "Resize the window freely and everything inside moves with it: the layout switches between Mini, Compact and Standard, scales up to fit, and shows a large album-art layout when tall. Replaces click-to-switch modes.",
+            "Resize the window freely and everything inside moves with it: the layout switches between Mini, Compact and Standard, scales up to fit, and shows a large album-art layout when tall. Replaces click-to-switch modes. A shrink button appears in the top bar when the window gets large.",
             toggle("dynamicResize"));
 
         const footer = h("div", "mp-footer");
@@ -727,9 +764,14 @@
     function formatTime(ms) {
         if (!ms || isNaN(ms) || ms < 0) return "0:00";
         const totalSec = Math.floor(ms / 1000);
-        const min = Math.floor(totalSec / 60);
+        const hours = Math.floor(totalSec / 3600);
+        const min = Math.floor((totalSec % 3600) / 60);
         const sec = totalSec % 60;
-        return `${min}:${sec < 10 ? "0" : ""}${sec}`;
+        const secText = sec < 10 ? `0${sec}` : `${sec}`;
+        // Episodes and audiobooks run for hours: 1:23:45 rather than 83:45
+        return hours > 0
+            ? `${hours}:${min < 10 ? "0" : ""}${min}:${secText}`
+            : `${min}:${secText}`;
     }
 
     function getTrackMetadata() {
@@ -758,6 +800,15 @@
                 artistList.push({ name, uri: item.metadata[i === 0 ? "artist_uri" : `artist_uri:${i}`] || "" });
             }
         }
+        // Podcast episodes have no artists: show the podcast's name instead, linking to its show page
+        const isEpisode = (item.uri || "").startsWith("spotify:episode:") || item.type === "episode";
+        let showUri = "";
+        if (!artistList.length && isEpisode) {
+            const showName = item.show?.name || item.metadata?.show_name || item.metadata?.album_title
+                || item.album?.name || item.metadata?.artist_name || "";
+            showUri = item.show?.uri || item.metadata?.show_uri || item.metadata?.album_uri || item.album?.uri || "";
+            if (showName) artistList.push({ name: showName, uri: showUri });
+        }
         const artists = artistList.length ? artistList.map(a => a.name).join(", ") : "Unknown Artist";
         const album = item.album?.name || item.metadata?.album_title || "";
         const cover = normalizeImageUrl(
@@ -772,7 +823,7 @@
             title,
             artist: artists,
             album,
-            albumUri: item.album?.uri || item.metadata?.album_uri || "",
+            albumUri: item.album?.uri || item.metadata?.album_uri || showUri || "",
             artistList,
             cover,
             duration: playerState.duration || (item.duration?.milliseconds || 0)
@@ -801,8 +852,8 @@
                 const saved = JSON.parse(localStorage.getItem(SIZE_KEY) || "null");
                 if (saved && Number.isFinite(saved.w) && Number.isFinite(saved.h)) {
                     return {
-                        width: clampNum(saved.w, FLUID_MIN_WIDTH, 1600, STANDARD_WIDTH),
-                        height: clampNum(saved.h, FLUID_MIN_HEIGHT, 1200, STANDARD_HEIGHT + UPCOMING_BAR_HEIGHT)
+                        width: clampNum(saved.w, FLUID_MIN_WIDTH, FLUID_MAX_WIDTH, STANDARD_WIDTH),
+                        height: clampNum(saved.h, FLUID_MIN_HEIGHT, FLUID_MAX_HEIGHT, STANDARD_HEIGHT + UPCOMING_BAR_HEIGHT)
                     };
                 }
             } catch (err) {}
@@ -853,6 +904,7 @@
         // Scale relative to the layout's design size (never below 1: the layouts are already tight)
         const raw = art ? w / STANDARD_WIDTH : Math.min(w / base[0], ch / base[1]);
         const s = Math.round(Math.min(art ? 1.5 : 1.8, Math.max(1, raw)) * 20) / 20;
+        const lyricsScale = Math.round(Math.min(2.5, Math.max(1, raw)) * 20) / 20;
         // Album art takes whatever height is left above the title, timeline and controls
         const artSize = art ? Math.round(Math.max(64, Math.min(w - 56, ch - 165 * s, 420))) : 0;
 
@@ -867,8 +919,13 @@
         const miniVol = mode === "mini";
         // Absolute minimum (240 wide): drop shuffle/repeat so title, transport, volume and close still fit
         const tiny = mode === "mini" && w < 300;
+        // Big window: offer a button that shrinks it back to the biggest mode enabled in settings
+        const shrinkTarget = biggestEnabledMode();
+        const shrinkSize = modeWindowSize(shrinkTarget);
+        const canShrink = pipWindow.innerWidth >= shrinkSize.width * FLUID_SHRINK_FACTOR
+            || pipWindow.innerHeight >= shrinkSize.height * FLUID_SHRINK_FACTOR;
 
-        const sig = `${mode}|${art}|${s}|${artSize}|${ctr}|${iconOnly}|${volW}|${miniVol}|${tiny}|${slim}`;
+        const sig = `${mode}|${art}|${s}|${lyricsScale}|${artSize}|${ctr}|${iconOnly}|${volW}|${miniVol}|${tiny}|${slim}|${canShrink}|${shrinkTarget}`;
         if (!force && sig === state.sig) return;
         state.sig = sig;
 
@@ -878,6 +935,7 @@
         }
         doc.body.classList.toggle("art-layout", art);
         doc.documentElement.style.setProperty("--s", String(s));
+        doc.documentElement.style.setProperty("--lyrics-s", String(lyricsScale));
         doc.documentElement.style.setProperty("--art", `${artSize}px`);
         doc.documentElement.style.setProperty("--vol-w", `${Math.max(40, volW)}px`);
         doc.body.classList.toggle("ctr-controls", ctr);
@@ -885,6 +943,8 @@
         doc.body.classList.toggle("mini-vol", miniVol);
         doc.body.classList.toggle("tiny", tiny);
         doc.body.classList.toggle("slim", slim);
+        doc.body.classList.toggle("can-shrink", canShrink);
+        doc.getElementById("btn-shrink")?.setAttribute("title", `Shrink to ${MODE_LABELS[shrinkTarget]} size`);
         doc.getElementById("btn-volume-icon")?.setAttribute("title", iconOnly ? "Volume" : "Mute / Unmute");
         // Layout changed so the volume row isn't available any more: close it
         if (mode !== "compact" && !iconOnly && !miniVol) {
@@ -895,12 +955,38 @@
         safeSetTimeout(() => updateMarqueeEffect(true), 50);
     }
 
+    // Fixed window size (content area, top bar included) of a mode
+    function modeWindowSize(mode) {
+        const base = mode === "mini" ? [MINI_WIDTH, MINI_HEIGHT]
+            : mode === "compact" ? [COMPACT_WIDTH, COMPACT_HEIGHT]
+            : [STANDARD_WIDTH, STANDARD_HEIGHT];
+        return { width: base[0], height: base[1] + UPCOMING_BAR_HEIGHT };
+    }
+
+    // The biggest mode left enabled in settings (MODES is ordered biggest first)
+    function biggestEnabledMode() {
+        return enabledModes()[0];
+    }
+
+    // Shrink button: resize the window down to the biggest enabled mode's fixed size
+    function shrinkToBiggestMode() {
+        if (!isPiPWindowOpen()) return;
+        const { width, height } = modeWindowSize(biggestEnabledMode());
+        try {
+            pipWindow.resizeTo(width + pipWindowFrameWidth, height + pipWindowFrameHeight);
+        } catch (err) {
+            console.warn("[MiniPlayer] Unable to shrink the window:", err);
+            Spicetify.showNotification("Couldn't resize the window", true);
+        }
+    }
+
     // Turning dynamic resizing off while the window is open: back to the fixed, saved mode
     function leaveFluidLayout() {
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
-        doc.body.classList.remove("fluid", "art-layout", "ctr-controls", "vol-icon-only", "mini-vol", "tiny", "slim");
+        doc.body.classList.remove("fluid", "art-layout", "ctr-controls", "vol-icon-only", "mini-vol", "tiny", "slim", "can-shrink");
         doc.documentElement.style.removeProperty("--s");
+        doc.documentElement.style.removeProperty("--lyrics-s");
         doc.documentElement.style.removeProperty("--art");
         doc.documentElement.style.removeProperty("--vol-w");
         const state = fluidState();
@@ -1027,7 +1113,9 @@
             return true;
         },
 
-        getQueue() {
+        // `limit` keeps this cheap: a podcast show can have thousands of episodes queued, and the top bar
+        // only needs the next one (the full list is only read while the queue panel is open)
+        getQueue(limit = 100) {
             const queue = Spicetify.Queue;
             const next = Array.isArray(queue?.nextTracks) ? queue.nextTracks : [];
             const currentUid = queue?.track?.contextTrack?.uid;
@@ -1042,17 +1130,21 @@
                     if (!name) break;
                     names.push(name);
                 }
+                // Podcast episodes have no artist: show the podcast (show) name and link to the show
+                const isEpisode = (contextTrack.uri || "").startsWith("spotify:episode:");
+                const showName = metadata.show_name || metadata.album_title || "";
+                const showUri = metadata.show_uri || metadata.album_uri || "";
                 items.push({
                     uid: contextTrack.uid,
                     uri: contextTrack.uri,
                     title: metadata.title || metadata.name || "Unknown track",
-                    artist: names.join(", "),
+                    artist: names.join(", ") || (isEpisode ? showName : ""),
                     image: queueImageUrl(metadata),
-                    albumUri: metadata.album_uri || "",
-                    artistUri: metadata.artist_uri || "",
+                    albumUri: isEpisode ? showUri : (metadata.album_uri || ""),
+                    artistUri: isEpisode ? showUri : (metadata.artist_uri || ""),
                     fromQueue: track.provider === "queue"
                 });
-                if (items.length >= 100) break;
+                if (items.length >= limit) break;
             }
             return items;
         }
@@ -1109,6 +1201,27 @@
         return changedKeys;
     }
 
+    // Playback position using Spotify's own maths. Spicetify.Player.getProgress() ignores playback speed
+    // (podcasts and audiobooks run at 1.25x, 1.5x, 2x...), keeps counting while buffering and can run past the
+    // end, so on episodes the bar crept slowly and then snapped forward whenever Spotify refreshed its state.
+    function getPlaybackProgress() {
+        const state = Spicetify.Player.origin?._state;
+        const position = state?.positionAsOfTimestamp;
+        if (!state || !Number.isFinite(position) || !Number.isFinite(state.timestamp)) {
+            return Spicetify.Player.getProgress() || 0;
+        }
+        if (state.isPaused || state.isBuffering) return position;
+        const speed = Number.isFinite(state.speed) && state.speed > 0 ? state.speed : 1;
+        const progress = position + (Date.now() - state.timestamp) * speed;
+        return state.duration > 0 ? Math.min(progress, state.duration) : progress;
+    }
+
+    // Seeks to an exact millisecond position. Spicetify.Player.seek() reads a non-integer 0..1 as a fraction
+    // but the integer 1 as 1 ms, so dragging the scrubber to the very end used to restart the episode.
+    function seekToMs(ms) {
+        Spicetify.Player.seek(Math.max(0, Math.round(ms)));
+    }
+
     function syncPlayerState(keys = Object.keys(playerState)) {
         const requested = new Set(keys);
         const needsPlayerData = ["currentTrack", "duration", "shuffle", "repeat"].some(key => requested.has(key));
@@ -1117,7 +1230,7 @@
 
         if (requested.has("currentTrack")) patch.currentTrack = data.item || null;
         if (requested.has("isPlaying")) patch.isPlaying = !!Spicetify.Player.isPlaying();
-        if (requested.has("progress")) patch.progress = Spicetify.Player.getProgress() || 0;
+        if (requested.has("progress")) patch.progress = getPlaybackProgress();
         if (requested.has("duration")) {
             patch.duration = Spicetify.Player.getDuration() || data.item?.duration?.milliseconds || 0;
         }
@@ -1127,7 +1240,7 @@
         }
         if (requested.has("shuffle")) patch.shuffle = !!data.shuffle;
         if (requested.has("repeat")) patch.repeat = Number(data.repeat) || 0;
-        if (requested.has("queue")) patch.queue = SpotifyAdapter.getQueue();
+        if (requested.has("queue")) patch.queue = SpotifyAdapter.getQueue(queueOpen ? 100 : 1);
         return publishPlayerState(patch);
     }
 
@@ -1262,8 +1375,10 @@
         add("Play now", () => playQueueItem(it));
         if (it.fromQueue) add("Remove from queue", () => removeQueueItem(it));
         if (it.albumUri || it.artistUri) sep();
-        if (it.albumUri) add("Go to album", () => openInSpotify(it.albumUri));
-        if (it.artistUri) add("Go to artist", () => openInSpotify(it.artistUri));
+        // Podcast episodes link to their show, which is both the "album" and the "artist"
+        const isShow = (it.albumUri || "").startsWith("spotify:show:");
+        if (it.albumUri) add(isShow ? "Go to show" : "Go to album", () => openInSpotify(it.albumUri));
+        if (it.artistUri && it.artistUri !== it.albumUri) add("Go to artist", () => openInSpotify(it.artistUri));
         sep();
         add(it.uri?.startsWith("spotify:local:") ? "Copy Spotify URI" : "Copy link", () => copyTrackLink(it));
 
@@ -1305,6 +1420,7 @@
         queueRenderDisposers = [];
         list.textContent = "";
         count.textContent = items.length ? String(items.length) : "";
+        const generation = ++queueRenderGeneration;
 
         if (!items.length) {
             const empty = doc.createElement("div");
@@ -1315,58 +1431,65 @@
         }
 
         let lastGroup = null;
-        items.forEach((it, idx) => {
-            const group = it.fromQueue ? "Next in queue" : "Next up";
-            if (currentMode === "standard" && group !== lastGroup) {
-                const heading = doc.createElement("div");
-                heading.className = "queue-group";
-                heading.textContent = group;
-                list.appendChild(heading);
-            }
-            lastGroup = group;
-            const row = doc.createElement("div");
-            row.className = "queue-item";
-            row.title = "Play this track";
-
-            const img = doc.createElement("img");
-            img.className = "queue-img";
-            img.alt = "";
-            img.draggable = false;
-            if (it.image) img.src = it.image;
-            row.appendChild(img);
-
-            const text = doc.createElement("div");
-            text.className = "queue-text";
-            const name = doc.createElement("div");
-            name.className = "queue-name";
-            name.textContent = it.title;
-            const artist = doc.createElement("div");
-            artist.className = "queue-artist";
-            artist.textContent = it.artist;
-            text.appendChild(name);
-            text.appendChild(artist);
-            row.appendChild(text);
-
-            // Three dots: more actions for this track
-            const more = doc.createElement("button");
-            more.className = "queue-more";
-            more.title = "More";
-            more.innerHTML = ICONS.more;
-            queueRenderDisposers.push(listenPiP(more, "click", (e) => {
-                e.stopPropagation();
-                if (queueMenuEl && queueMenuEl.dataset.uid === String(it.uid || it.uri)) {
-                    closeQueueMenu();
-                    return;
+        let index = 0;
+        const renderBatch = () => {
+            if (generation !== queueRenderGeneration || !isPiPWindowOpen() || !queueOpen) return;
+            const fragment = doc.createDocumentFragment();
+            const end = Math.min(index + 20, items.length);
+            for (; index < end; index++) {
+                const it = items[index];
+                const group = it.fromQueue ? "Next in queue" : "Next up";
+                if (currentMode === "standard" && group !== lastGroup) {
+                    const heading = doc.createElement("div");
+                    heading.className = "queue-group";
+                    heading.textContent = group;
+                    fragment.appendChild(heading);
                 }
-                openQueueMenu(it, more);
-            }));
-            row.appendChild(more);
+                lastGroup = group;
+                const row = doc.createElement("div");
+                row.className = "queue-item";
+                row.title = "Play this track";
 
-            // Clicking the row plays exactly this track
-            queueRenderDisposers.push(listenPiP(row, "click", () => playQueueItem(it)));
-            list.appendChild(row);
-        });
-        list.scrollTop = scrollTop;
+                const img = doc.createElement("img");
+                img.className = "queue-img";
+                img.alt = "";
+                img.draggable = false;
+                if (it.image) img.src = it.image;
+                row.appendChild(img);
+
+                const text = doc.createElement("div");
+                text.className = "queue-text";
+                const name = doc.createElement("div");
+                name.className = "queue-name";
+                name.textContent = it.title;
+                const artist = doc.createElement("div");
+                artist.className = "queue-artist";
+                artist.textContent = it.artist;
+                text.appendChild(name);
+                text.appendChild(artist);
+                row.appendChild(text);
+
+                const more = doc.createElement("button");
+                more.className = "queue-more";
+                more.title = "More";
+                more.innerHTML = ICONS.more;
+                queueRenderDisposers.push(listenPiP(more, "click", (e) => {
+                    e.stopPropagation();
+                    if (queueMenuEl && queueMenuEl.dataset.uid === String(it.uid || it.uri)) {
+                        closeQueueMenu();
+                        return;
+                    }
+                    openQueueMenu(it, more);
+                }));
+                row.appendChild(more);
+                queueRenderDisposers.push(listenPiP(row, "click", () => playQueueItem(it)));
+                fragment.appendChild(row);
+            }
+            list.appendChild(fragment);
+            if (index < items.length) pipResources?.requestAnimationFrame(renderBatch);
+            else list.scrollTop = scrollTop;
+        };
+        renderBatch();
     }
 
     // Expand compact queue windows while open, then restore their mode dimensions.
@@ -1375,6 +1498,7 @@
         const doc = pipWindow.document;
         closeQueueMenu();
         if (!queueOpen) {
+            queueRenderGeneration++;
             queueRenderDisposers.forEach(dispose => dispose?.());
             queueRenderDisposers = [];
         }
@@ -1494,8 +1618,15 @@
 
             // Player state sync is separate from the queue and window-position polling.
             pipResources.setInterval(syncPlayerStateTick, PLAYER_STATE_SYNC_MS);
+            // Queue polling: the top bar only needs the first item, and podcast shows can have thousands of
+            // queued episodes, so poll less often for them (and not at all while the window is hidden)
+            let queueTick = 0;
             pipResources.setInterval(() => {
-                if (settings.showUpcoming || queueOpen) syncPlayerState(["queue"]);
+                if (!(settings.showUpcoming || queueOpen)) return;
+                if (!queueOpen && pipWindow?.document?.hidden) return;
+                const onEpisode = (playerState.currentTrack?.uri || "").startsWith("spotify:episode:");
+                if (onEpisode && (queueTick++ % 3) !== 0) return;
+                syncPlayerState(["queue"]);
             }, QUEUE_STATE_SYNC_MS);
             pipResources.setInterval(saveWindowPosition, WINDOW_POSITION_SYNC_MS);
 
@@ -1540,10 +1671,44 @@
         }
     }
 
-    function updateButtonStates(isActive) {
+    function updateButtonStates(isActive, natives = null) {
         const domPlaybarBtn = document.getElementById("miniplayer-playbar-btn");
         if (domPlaybarBtn) {
             domPlaybarBtn.style.color = isActive ? "#1db954" : "#b3b3b3";
+        }
+        // Spotify's own button (when we've taken it over) lights up green while our player is open
+        (natives || findNativeMiniplayerButtons()).forEach((el) => {
+            if (settings.replaceNative && isActive) el.setAttribute("data-mp-active", "true");
+            else el.removeAttribute("data-mp-active");
+        });
+    }
+
+    // ---------- Taking over Spotify's own mini player button ----------
+    // We find Spotify's button by its test id or its exact label. If Spotify renames either (or the
+    // label is translated), nothing matches and we simply fall back to our own playbar button.
+    const NATIVE_MINIPLAYER_TESTIDS = ["pip-toggle-button", "control-button-pip", "miniplayer-button", "mini-player-button"];
+    const NATIVE_MINIPLAYER_LABELS = ["miniplayer"]; // compared lowercase with spaces/dashes removed
+
+    function isNativeMiniplayerButton(el) {
+        if (!el || el.id === "miniplayer-playbar-btn") return false;
+        const testId = (el.getAttribute("data-testid") || "").toLowerCase();
+        if (testId && NATIVE_MINIPLAYER_TESTIDS.includes(testId)) return true;
+        // Exact match only, so our own "Mini Player (Alt+M)" / "Mini Player Settings" buttons never count
+        const label = (el.getAttribute("aria-label") || "").toLowerCase().replace(/[\s_-]+/g, "");
+        return !!label && NATIVE_MINIPLAYER_LABELS.includes(label);
+    }
+
+    function findNativeMiniplayerButtons(scope = null) {
+        try {
+            // Never fall back to document: episode pages can contain hundreds of unrelated playback controls.
+            const playbackBar = scope || document.querySelector(
+                ".main-nowPlayingBar-container, [data-testid='now-playing-bar'], .main-nowPlayingBar-right, [data-testid='now-playing-bar-right']"
+            );
+            if (!playbackBar) return [];
+            return Array.from(playbackBar.querySelectorAll("button[data-testid], button[aria-label], [role='button'][aria-label]"))
+                .filter(isNativeMiniplayerButton);
+        } catch (e) {
+            return [];
         }
     }
 
@@ -2043,6 +2208,80 @@
                 flex-grow: 1;
                 overflow: hidden;
             }
+            .lyrics-display {
+                display: none;
+                flex: 1 1 0;
+                min-width: 0;
+                max-height: 52px;
+                flex-direction: column;
+                justify-content: center;
+                gap: 3px;
+                overflow: hidden;
+                text-align: left;
+                pointer-events: none;
+            }
+            .lyrics-action-group {
+                display: flex;
+                align-items: center;
+                gap: 2px;
+            }
+            .lyrics-text-mode {
+                display: none;
+                align-items: center;
+                justify-content: center;
+                height: 20px;
+                padding: 0 5px;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 4px;
+                background: rgba(255, 255, 255, 0.1);
+                color: rgba(255, 255, 255, 0.72);
+                font-size: 8.5px;
+                font-weight: 700;
+                line-height: 1;
+                white-space: nowrap;
+            }
+            body.lyrics-mode .lyrics-text-mode {
+                display: inline-flex;
+            }
+            .lyrics-text-mode:hover {
+                background: rgba(255, 255, 255, 0.18);
+                color: #ffffff;
+            }
+            .lyrics-text-mode:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+            .lyrics-current,
+            .lyrics-next {
+                display: -webkit-box;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .lyrics-current {
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: 600;
+                line-height: 16px;
+                padding-right: 22px;
+                -webkit-line-clamp: 2;
+            }
+            .lyrics-next {
+                color: rgba(255, 255, 255, 0.58);
+                font-size: 10px;
+                line-height: 12px;
+                -webkit-line-clamp: 1;
+            }
+            .lyrics-next.is-empty {
+                display: none;
+            }
+            body.lyrics-mode .cover-container,
+            body.lyrics-mode .meta-container {
+                display: none !important;
+            }
+            body.lyrics-mode .lyrics-display {
+                display: flex;
+            }
             .meta-row {
                 display: flex;
                 align-items: center;
@@ -2278,6 +2517,7 @@
             body.compact-mode #btn-shuffle,
             body.compact-mode #btn-repeat,
             body.compact-mode .controls-spacer,
+            body.compact-mode .lyrics-action-group,
             body.compact-mode .controls-section {
                 display: none !important;
             }
@@ -2318,6 +2558,18 @@
             body.compact-mode .track-artist {
                 font-size: 10.5px;
                 margin-top: 1px;
+            }
+            body.compact-mode .lyrics-display {
+                max-height: 42px;
+                gap: 2px;
+            }
+            body.compact-mode .lyrics-current {
+                font-size: 11px;
+                line-height: 13px;
+            }
+            body.compact-mode .lyrics-next {
+                font-size: 9px;
+                line-height: 10px;
             }
             body.compact-mode .playback-controls {
                 gap: 8px;
@@ -2457,6 +2709,21 @@
             body.mini-mode #btn-volume-compact {
                 display: none !important;
             }
+            body.mini-mode .lyrics-display {
+                max-height: 20px;
+            }
+            body.mini-mode .lyrics-next {
+                display: none;
+            }
+            body.mini-mode .lyrics-current {
+                -webkit-line-clamp: 1;
+            }
+            body.mini-mode.lyrics-both .lyrics-display {
+                max-height: 26px;
+            }
+            body.mini-mode.lyrics-both .lyrics-next {
+                display: -webkit-box;
+            }
             body.mini-mode .meta-container {
                 max-width: 140px;
                 flex: 1 1 0;
@@ -2546,6 +2813,41 @@
             body.fluid.compact-mode .track-title { font-size: calc(12.5px * var(--s, 1)); }
             body.fluid .track-artist { font-size: calc(11.5px * var(--s, 1)); }
             body.fluid.compact-mode .track-artist { font-size: calc(10.5px * var(--s, 1)); }
+            body.fluid .lyrics-display {
+                max-height: calc(52px * var(--lyrics-s, 1));
+                gap: calc(3px * var(--s, 1));
+            }
+            body.fluid .lyrics-current {
+                font-size: calc(13px * var(--lyrics-s, 1));
+                line-height: calc(16px * var(--lyrics-s, 1));
+            }
+            body.fluid .lyrics-next {
+                font-size: calc(10px * var(--lyrics-s, 1));
+                line-height: calc(12px * var(--lyrics-s, 1));
+            }
+            body.fluid .lyrics-text-mode {
+                height: calc(20px * var(--s, 1));
+                padding: 0 calc(5px * var(--s, 1));
+                font-size: calc(8.5px * var(--s, 1));
+            }
+            body.fluid.compact-mode .lyrics-display {
+                max-height: calc(42px * var(--lyrics-s, 1));
+                gap: calc(2px * var(--s, 1));
+            }
+            body.fluid.compact-mode .lyrics-current {
+                font-size: calc(11px * var(--lyrics-s, 1));
+                line-height: calc(13px * var(--lyrics-s, 1));
+            }
+            body.fluid.compact-mode .lyrics-next {
+                font-size: calc(9px * var(--lyrics-s, 1));
+                line-height: calc(10px * var(--lyrics-s, 1));
+            }
+            body.fluid.mini-mode .lyrics-display {
+                max-height: calc(20px * var(--s, 1));
+            }
+            body.fluid.mini-mode.lyrics-both .lyrics-display {
+                max-height: calc(26px * var(--s, 1));
+            }
             body.fluid .time-label { font-size: calc(10px * var(--s, 1)); min-width: calc(26px * var(--s, 1)); }
             body.fluid.compact-mode .time-label { font-size: calc(9.5px * var(--s, 1)); min-width: calc(24px * var(--s, 1)); }
             body.fluid .icon-btn { width: calc(22px * var(--s, 1)); height: calc(22px * var(--s, 1)); }
@@ -2618,6 +2920,13 @@
             body.fluid.mini-vol.mini-mode .volume-popup { display: flex !important; top: calc(50% - 9px); bottom: auto; }
             body.fluid.mini-vol.mini-mode .track-section { transition: opacity 0.22s ease; }
             body.fluid.mini-vol.mini-mode.volume-open .track-section { opacity: 0; pointer-events: none; }
+            /* Long-form audio (episodes, audiobooks): never wrap the time, and widen the labels for 1:23:45 */
+            .time-label { white-space: nowrap; }
+            body .miniplayer-card.long-form .time-label { min-width: calc(40px * var(--s, 1)); }
+            /* Shrink button (top bar): only while the window is much bigger than the biggest enabled mode */
+            .shrink-btn { display: none; margin-left: auto; }
+            body.fluid.can-shrink .shrink-btn { display: inline-flex; }
+            body.fluid.can-shrink .shrink-btn + .queue-btn { margin-left: 0; }
             /* Slim (window under 74px tall): the top bar steps aside so the card gets the whole height */
             body.fluid.slim .upcoming-bar { display: none; }
             /* Tiny (Mini under 300px wide): shuffle/repeat drop out, padding tightens, volume stays */
@@ -2682,6 +2991,7 @@
             <div class="upcoming-bar" id="upcoming-bar">
                 <span class="upcoming-label"><span class="upcoming-dot"></span>Next</span>
                 <span class="upcoming-text" id="upcoming-text"><span id="upcoming-title" class="upcoming-title"></span><span id="upcoming-artist" class="upcoming-artist"></span></span>
+                <button class="queue-btn shrink-btn" id="btn-shrink" title="Shrink">${ICONS.shrink}</button>
                 <button class="queue-btn" id="btn-queue" title="Queue">${ICONS.queue}</button>
             </div>
             <div class="miniplayer-card" id="miniplayer-card">
@@ -2699,6 +3009,12 @@
                         Spotify
                     </div>
                     <div class="window-actions">
+                        <div class="lyrics-action-group">
+                            <button class="icon-btn" id="btn-lyrics" title="Show SpicyLyrics" aria-label="Show SpicyLyrics" aria-pressed="false">
+                                ${ICONS.lyrics}
+                            </button>
+                            <button class="lyrics-text-mode" id="btn-lyrics-text-mode" title="Lyrics text: Original (click to cycle)" aria-label="Lyrics text: Original (click to cycle)">Original</button>
+                        </div>
                         <button class="icon-btn" id="btn-close" title="Close Mini Player">
                             ${ICONS.close}
                         </button>
@@ -2720,6 +3036,10 @@
                             </div>
                         </div>
                         <div id="track-artist" class="track-artist" title="">Spotify</div>
+                    </div>
+                    <div class="lyrics-display" id="lyrics-display" aria-live="off">
+                        <div class="lyrics-current" id="lyrics-current">Open SpicyLyrics to mirror its lyrics</div>
+                        <div class="lyrics-next" id="lyrics-next"></div>
                     </div>
 
                     <!-- Compact Mode Inline Actions Cluster -->
@@ -2748,6 +3068,12 @@
                             <button class="icon-btn mini-only" id="btn-mode-mini" title="Switch mode">
                                 ${MODE_ICONS[nextMode()]}
                             </button>
+                            <div class="lyrics-action-group">
+                                <button class="icon-btn" id="btn-lyrics-compact" title="Show SpicyLyrics" aria-label="Show SpicyLyrics" aria-pressed="false">
+                                    ${ICONS.lyrics}
+                                </button>
+                                <button class="lyrics-text-mode" id="btn-lyrics-text-mode-compact" title="Lyrics text: Original (click to cycle)" aria-label="Lyrics text: Original (click to cycle)">Original</button>
+                            </div>
                             <button class="icon-btn" id="btn-close-compact" title="Close Mini Player">
                                 ${ICONS.close}
                             </button>
@@ -2759,7 +3085,7 @@
                 <div class="progress-section" id="progress-section">
                     <span id="time-current" class="time-label">0:00</span>
                     <div class="progress-bar-container">
-                        <input type="range" id="progress-slider" class="progress-slider" min="0" max="1000" value="0" />
+                        <input type="range" id="progress-slider" class="progress-slider" min="0" max="10000" value="0" />
                     </div>
                     <span id="time-duration" class="time-label">0:00</span>
                 </div>
@@ -2887,6 +3213,39 @@
             toggleMode();
         });
 
+        const lyricsButtons = [
+            doc.getElementById("btn-lyrics"),
+            doc.getElementById("btn-lyrics-compact")
+        ].filter(Boolean);
+        const lyricsTextModeButtons = [
+            doc.getElementById("btn-lyrics-text-mode"),
+            doc.getElementById("btn-lyrics-text-mode-compact")
+        ].filter(Boolean);
+        syncLyricsTextModeButton();
+        lyricsTextModeButtons.forEach(button => listenPiP(button, "click", () => {
+            if (!lyricsRomanizationAvailable) return;
+            const index = LYRICS_TEXT_MODES.indexOf(lyricsTextMode);
+            lyricsTextMode = LYRICS_TEXT_MODES[(index + 1) % LYRICS_TEXT_MODES.length];
+            doc.body.classList.toggle("lyrics-both", lyricsTextMode === "both");
+            syncLyricsTextModeButton();
+            refreshLyricsAdapter();
+        }));
+        const setLyricsMode = (enabled) => {
+            doc.body.classList.toggle("lyrics-mode", enabled);
+            doc.body.classList.toggle("lyrics-both", lyricsTextMode === "both");
+            for (const button of lyricsButtons) {
+                button.classList.toggle("active", enabled);
+                button.setAttribute("aria-pressed", String(enabled));
+                button.title = enabled ? "Hide SpicyLyrics" : "Show SpicyLyrics";
+                button.setAttribute("aria-label", button.title);
+            }
+            if (enabled) startLyricsAdapter();
+            else stopLyricsAdapter();
+        };
+        lyricsButtons.forEach(button => listenPiP(button, "click", () => {
+            setLyricsMode(!doc.body.classList.contains("lyrics-mode"));
+        }));
+
         // Click the title -> album page, click an artist name -> that artist's page.
         // Clicks that were really a window drag are ignored.
         const bindLink = (root, selector, getUri) => {
@@ -2908,12 +3267,15 @@
         bindLink(doc.getElementById("title-wrapper"), ".artist-link.linkable", (el) => el.dataset.uri || "");
         bindLink(doc.getElementById("track-artist"), ".artist-link.linkable", (el) => el.dataset.uri || "");
 
+        // Shrink button (large window): back to the biggest mode that's enabled in settings
+        listenPiP(doc.getElementById("btn-shrink"), "click", shrinkToBiggestMode);
+
         // Queue button in the top bar: show/hide the queue list.
         const queueButton = doc.getElementById("btn-queue");
         listenPiP(queueButton, "click", () => {
             queueOpen = !queueOpen;
-            if (queueOpen) syncPlayerState(["queue"]);
             applyQueueLayout();
+            if (queueOpen) safeSetTimeout(() => syncPlayerState(["queue"]), 50);
         });
         listenPiP(queueButton, "keydown", (e) => {
             if (e.code === "Space" || e.key === " ") e.preventDefault();
@@ -3010,7 +3372,7 @@
             listenPiP(progressSlider, "input", (e) => {
                 const duration = playerState.duration;
                 // @ts-ignore
-                const pct = (e.target.value / 1000);
+                const pct = (e.target.value / PROGRESS_STEPS);
                 const currentMs = duration * pct;
                 const timeCurrent = doc.getElementById("time-current");
                 if (timeCurrent) {
@@ -3024,8 +3386,8 @@
             });
             listenPiP(progressSlider, "change", (e) => {
                 // @ts-ignore
-                const pct = (e.target.value / 1000);
-                Spicetify.Player.seek(pct);
+                const pct = (e.target.value / PROGRESS_STEPS);
+                seekToMs(pct * playerState.duration);
                 isUserSeeking = false;
                 updatePlayerState({ progress: pct * playerState.duration });
                 startProgressLoop();
@@ -3145,7 +3507,7 @@
                     const next = Math.min(Math.max(duration - 1000, 0), Math.max(0, base + dir * settings.seekStep * 1000));
                     lastWheelSeekMs = next;
                     lastWheelSeekAt = now;
-                    Spicetify.Player.seek(next / duration);
+                    seekToMs(next);
                     updatePlayerState({ progress: next });
 
                     // Reflect immediately and hold the tick off briefly so it doesn't flicker back
@@ -3166,7 +3528,7 @@
                     const slider = doc.getElementById("progress-slider");
                     if (slider) {
                         // @ts-ignore
-                        slider.value = String(Math.round((next / duration) * 1000));
+                        slider.value = String(Math.round((next / duration) * PROGRESS_STEPS));
                         updateSliderFill(slider, (next / duration) * 100);
                     }
                 } else {
@@ -3248,6 +3610,16 @@
     function applyModeLayout() {
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
+        if (currentMode !== "standard") {
+            doc.body.classList.remove("lyrics-mode", "lyrics-both");
+            for (const button of doc.querySelectorAll("#btn-lyrics, #btn-lyrics-compact")) {
+                button.classList.remove("active");
+                button.setAttribute("aria-pressed", "false");
+                button.title = "Show SpicyLyrics";
+                button.setAttribute("aria-label", button.title);
+            }
+            stopLyricsAdapter();
+        }
         // Popup only exists in compact mode; close it when the layout changes
         doc.getElementById("volume-popup")?.classList.remove("open");
         doc.body.classList.remove("volume-open");
@@ -3421,6 +3793,8 @@
         const durationEl = doc.getElementById("time-duration");
         if (durationEl) {
             durationEl.textContent = formatTime(meta.duration);
+            // Hour-long audio needs wider time labels (1:23:45), or the scrubber resizes as the time ticks over
+            doc.getElementById("miniplayer-card")?.classList.toggle("long-form", meta.duration >= 3600000);
         }
         renderProgressUI();
 
@@ -3430,6 +3804,173 @@
 
         // Volume
         updateVolumeUI();
+    }
+
+    function stopLyricsAdapter() {
+        if (lyricsPollTimerId !== null) {
+            window.clearInterval(lyricsPollTimerId);
+            lyricsPollTimerId = null;
+        }
+        if (lyricsRefreshTimerId !== null) {
+            window.clearTimeout(lyricsRefreshTimerId);
+            lyricsRefreshTimerId = null;
+        }
+        lyricsObserver?.disconnect();
+        lyricsObserver = null;
+        lyricsSource = null;
+        lastLyricsSnapshotKey = "";
+        lyricsRomanizationAvailable = false;
+        syncLyricsTextModeButton();
+    }
+
+    function syncLyricsTextModeButton() {
+        if (!isPiPWindowOpen()) return;
+        const label = LYRICS_TEXT_MODE_LABELS[lyricsTextMode];
+        const text = lyricsRomanizationAvailable ? label : "Source";
+        const title = lyricsRomanizationAvailable
+            ? `Lyrics text: ${label} (click to cycle)`
+            : "Showing SpicyLyrics' selected text; choose Under each line in SpicyLyrics to switch variants";
+        for (const button of pipWindow.document.querySelectorAll(
+            "#btn-lyrics-text-mode, #btn-lyrics-text-mode-compact"
+        )) {
+            button.disabled = !lyricsRomanizationAvailable;
+            button.textContent = text;
+            button.title = title;
+            button.setAttribute("aria-label", title);
+        }
+    }
+
+    function renderLyricsSnapshot(status, current = "", next = "") {
+        if (!isPiPWindowOpen()) return;
+        const doc = pipWindow.document;
+        const currentEl = doc.getElementById("lyrics-current");
+        const nextEl = doc.getElementById("lyrics-next");
+        if (!currentEl || !nextEl) return;
+
+        const key = [status, current, next].join("\u0000");
+        if (key === lastLyricsSnapshotKey) return;
+        lastLyricsSnapshotKey = key;
+        currentEl.textContent = current || status;
+        nextEl.textContent = next;
+        nextEl.classList.toggle("is-empty", !next);
+    }
+
+    function normalizeLyricsText(text) {
+        return text
+            .replace(/\s+/g, " ")
+            .replace(/\s+([,.;!?…:;])/g, "$1")
+            .replace(/([([{“‘])\s+/g, "$1")
+            .trim();
+    }
+
+    function getSpicyLyricsLineText(line) {
+        const primaryLine = line.cloneNode(true);
+        primaryLine.querySelectorAll(".RomanizedRow").forEach(row => row.remove());
+        const words = Array.from(primaryLine.children)
+            .filter(element =>
+                element.matches(".word, .word-group, .letterGroup")
+                && !element.classList.contains("dot")
+            )
+            .map(element => element.textContent.replace(/\s+/g, " ").trim())
+            .filter(Boolean);
+        return normalizeLyricsText(words.length ? words.join(" ") : primaryLine.textContent);
+    }
+
+    function getSpicyLyricsRomanizedText(line) {
+        const row = line.querySelector(".RomanizedRow");
+        return row ? normalizeLyricsText(row.textContent) : "";
+    }
+
+    function refreshLyricsAdapter() {
+        if (!isPiPWindowOpen() || !pipWindow.document.body.classList.contains("lyrics-mode")) return;
+
+        const page = document.querySelector("#SpicyLyricsPage");
+        const content = page?.querySelector(".LyricsContainer .LyricsContent")
+            || page?.querySelector(".LyricsContent")
+            || null;
+
+        if (content !== lyricsSource) {
+            lyricsObserver?.disconnect();
+            lyricsObserver = null;
+            lyricsSource = content;
+            if (content) {
+                lyricsObserver = new MutationObserver(records => {
+                    if (records.some(record =>
+                        record.type === "childList"
+                        || record.type === "characterData"
+                        || (record.type === "attributes" && record.target.matches(".line"))
+                    )) {
+                        if (lyricsRefreshTimerId !== null) return;
+                        lyricsRefreshTimerId = window.setTimeout(() => {
+                            lyricsRefreshTimerId = null;
+                            refreshLyricsAdapter();
+                        }, 90);
+                    }
+                });
+                lyricsObserver.observe(content, {
+                    subtree: true,
+                    childList: true,
+                    characterData: true,
+                    attributes: true,
+                    attributeFilter: ["class"]
+                });
+            }
+        }
+
+        if (!page) {
+            lyricsRomanizationAvailable = false;
+            syncLyricsTextModeButton();
+            renderLyricsSnapshot(
+                window.SpicyLyrics ? "Open SpicyLyrics to display its lyrics" : "SpicyLyrics is not detected"
+            );
+            return;
+        }
+        if (!content) {
+            lyricsRomanizationAvailable = false;
+            syncLyricsTextModeButton();
+            renderLyricsSnapshot("Waiting for SpicyLyrics lyrics…");
+            return;
+        }
+
+        const lines = Array.from(content.querySelectorAll(".line"))
+            .map(element => ({
+                element,
+                original: getSpicyLyricsLineText(element),
+                romanized: getSpicyLyricsRomanizedText(element)
+            }))
+            .filter(line => line.original || line.romanized);
+        lyricsRomanizationAvailable = lines.some(line => line.romanized);
+        syncLyricsTextModeButton();
+        if (!lines.length) {
+            renderLyricsSnapshot("No lyric lines are available yet");
+            return;
+        }
+
+        const activeIndex = lines.findIndex(line => line.element.classList.contains("Active"));
+        if (activeIndex < 0) {
+            renderLyricsSnapshot("...");
+            return;
+        }
+        const active = lines[activeIndex];
+        const following = lines[activeIndex + 1];
+        if (lyricsTextMode === "romanized") {
+            renderLyricsSnapshot(
+                "",
+                active.romanized || active.original || "...",
+                following?.romanized || following?.original || ""
+            );
+        } else if (lyricsTextMode === "both") {
+            renderLyricsSnapshot("", active.original || "...", active.romanized || "");
+        } else {
+            renderLyricsSnapshot("", active.original || "...", following?.original || "");
+        }
+    }
+
+    function startLyricsAdapter() {
+        stopLyricsAdapter();
+        renderLyricsSnapshot("Looking for SpicyLyrics…");
+        refreshLyricsAdapter();
+        lyricsPollTimerId = window.setInterval(refreshLyricsAdapter, 1000);
     }
 
     function updatePlayPauseButton() {
@@ -3529,7 +4070,7 @@
 
         if (slider && durationMs > 0) {
             const pct = Math.min(1, Math.max(0, currentMs / durationMs));
-            const sliderVal = Math.round(pct * 1000);
+            const sliderVal = Math.round(pct * PROGRESS_STEPS);
             if (sliderVal !== lastSliderValue) {
                 lastSliderValue = sliderVal;
                 // @ts-ignore
@@ -3540,26 +4081,32 @@
     }
 
     function startProgressLoop() {
-        if (rafId !== null) return;
+        if (rafId !== null || progressTimerId !== null) return;
         const resources = pipResources;
         if (!isPiPWindowOpen() || !resources) return;
 
-        const loop = () => {
+        const paint = () => {
             rafId = null;
-            if (!isPiPWindowOpen()) {
-                return;
-            }
+            if (!isPiPWindowOpen() || !playerState.isPlaying || pipWindow.document.hidden) return;
 
-            if (!pipWindow.document.hidden && !isUserSeeking) {
+            const now = Date.now();
+            // One scrubber step is duration / PROGRESS_STEPS long, so a 3 hour episode doesn't need 60 repaints a second
+            const gap = Math.min(500, Math.max(33, (playerState.duration || 0) / PROGRESS_STEPS / 2));
+            if (!isUserSeeking && now - lastProgressPaint >= gap) {
+                lastProgressPaint = now;
                 updateProgressVisuals();
             }
 
-            if (playerState.isPlaying) {
-                rafId = resources.requestAnimationFrame(loop);
-            }
+            if (!playerState.isPlaying) return;
+            const delay = isUserSeeking ? gap : Math.max(0, gap - (now - lastProgressPaint));
+            progressTimerId = resources.setTimeout(() => {
+                progressTimerId = null;
+                if (!isPiPWindowOpen() || !playerState.isPlaying || pipWindow.document.hidden) return;
+                rafId = resources.requestAnimationFrame(paint);
+            }, delay);
         };
 
-        rafId = resources.requestAnimationFrame(loop);
+        rafId = resources.requestAnimationFrame(paint);
     }
 
     function syncPlayerStateTick() {
@@ -3675,21 +4222,49 @@
                 return true;
             };
 
-            let playbarObserver = null;
-            const initPlaybarIcon = () => {
-                if (addPlaybarIcon()) {
-                    if (!playbarObserver) {
-                        const target = document.querySelector(".main-nowPlayingBar-container") || document.querySelector(".main-nowPlayingBar-right") || document.body;
-                        playbarObserver = new MutationObserver(() => {
-                            if (!document.getElementById("miniplayer-playbar-btn")) {
-                                addPlaybarIcon();
-                            }
-                        });
-                        playbarObserver.observe(target, { childList: true, subtree: true });
-                    }
-                    return true;
+            // Keeps the playback bar showing the right launcher as Spotify re-renders it:
+            // - taking over Spotify's own button (found + setting on): hide ours, no extra icon
+            // - otherwise (setting off, or Spotify's button not found): show ours
+            syncPlaybarButtons = () => {
+                const rightControls = document.querySelector(".main-nowPlayingBar-right")
+                    || document.querySelector('[data-testid="now-playing-bar-right"]');
+                const playbackBar = document.querySelector(".main-nowPlayingBar-container, [data-testid='now-playing-bar']")
+                    || rightControls;
+                const natives = findNativeMiniplayerButtons(playbackBar);
+                const takeover = settings.replaceNative && natives.length > 0;
+                natives.forEach((el) => {
+                    if (takeover) el.setAttribute("data-mp-takeover", "true");
+                    else el.removeAttribute("data-mp-takeover");
+                });
+                if (takeover) {
+                    document.getElementById("miniplayer-playbar-btn")?.remove();
+                } else {
+                    addPlaybarIcon();
                 }
-                return false;
+                updateButtonStates(isPiPWindowOpen(), natives);
+            };
+
+            let playbarObserver = null;
+            let syncQueued = false;
+            const queueSync = () => {
+                if (syncQueued) return;
+                syncQueued = true;
+                // Debounced: the playback bar re-renders constantly during playback and each sync scans the DOM
+                setTimeout(() => {
+                    syncQueued = false;
+                    syncPlaybarButtons();
+                }, 300);
+            };
+            const initPlaybarIcon = () => {
+                const rightControls = document.querySelector(".main-nowPlayingBar-right") || document.querySelector('[data-testid="now-playing-bar-right"]');
+                if (!rightControls) return false;
+                syncPlaybarButtons();
+                if (!playbarObserver) {
+                    const target = document.querySelector(".main-nowPlayingBar-container") || rightControls || document.body;
+                    playbarObserver = new MutationObserver(queueSync);
+                    playbarObserver.observe(target, { childList: true, subtree: true });
+                }
+                return true;
             };
 
             if (!initPlaybarIcon()) {
@@ -3701,6 +4276,28 @@
             }
         } catch (e) {
             console.warn("[MiniPlayer] Playbar injection error:", e);
+        }
+
+        // 2b. Take over Spotify's own mini player button: intercept its click (capture phase, so Spotify's
+        // handler never runs) and open our player instead. Does nothing when the setting is off.
+        try {
+            const takeoverStyle = document.createElement("style");
+            takeoverStyle.id = "miniplayer-takeover-style";
+            takeoverStyle.textContent = `[data-mp-active="true"], [data-mp-active="true"] svg { color: #1ed760 !important; fill: #1ed760 !important; }`;
+            document.head.appendChild(takeoverStyle);
+
+            document.addEventListener("click", (e) => {
+                if (!settings.replaceNative) return;
+                const t = /** @type {any} */ (e.target);
+                const el = t && t.closest ? t.closest("button, [role='button']") : null;
+                if (!el || !isNativeMiniplayerButton(el)) return;
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                toggleMiniPlayer();
+            }, true);
+        } catch (e) {
+            console.warn("[MiniPlayer] Could not set up the native button takeover:", e);
         }
 
         // 3. Global Shortcut within Spotify (Alt + M)
