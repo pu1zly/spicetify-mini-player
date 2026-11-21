@@ -25,6 +25,9 @@ An always-on-top, draggable mini player extension for Spotify using Chromium's D
     <p align="center">
       <img src="assets/mini-mode.png" alt="Mini Mode" />
     </p>
+- **SpicyLyrics Integration**: Mirrors the currently displayed and upcoming lyric lines from SpicyLyrics into the player. Lyrics are available in Standard Mode only. When SpicyLyrics exposes a romanized line, cycle between **Original**, **Romanized**, and **Both**; otherwise, the player shows SpicyLyrics' selected text. For variant switching, set SpicyLyrics to **Under each line**.
+- **Lyrics That Scale with the Window**: With Dynamic Resizing enabled, lyric text grows with larger window sizes, independently of the rest of the interface, up to 2.5x its base scale.
+- **Dynamic Resizing**: An experimental setting that lets the window resize freely, switches between Mini, Compact, and Standard layouts, scales the interface, and shows a larger album-art layout when tall. A top-bar button can shrink the window back to the largest fixed mode.
 - **Next Up Display**: Shows upcoming queue items in a top bar by reading the queue directly.
 - **Smooth Playback**: Powered by `requestAnimationFrame` for timeline updates without unneeded DOM manipulation.
 - **Native Dragging**: Move the player anywhere on screen using header or empty card areas.
