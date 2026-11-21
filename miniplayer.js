@@ -45,6 +45,8 @@
         romanized: "Romanized",
         both: "Both"
     };
+    const LYRICS_POLL_INTERVAL_MS = 100;
+    const LYRICS_REFRESH_DEBOUNCE_MS = 40;
     let isUserSeeking = false;
     let isAdjustingVolume = false;
     let lastFormattedTime = "";
@@ -2215,7 +2217,7 @@
                 max-height: 52px;
                 flex-direction: column;
                 justify-content: center;
-                gap: 3px;
+                gap: 8px;
                 overflow: hidden;
                 text-align: left;
                 pointer-events: none;
@@ -2267,6 +2269,7 @@
                 -webkit-line-clamp: 2;
             }
             .lyrics-next {
+                display: none;
                 color: rgba(255, 255, 255, 0.58);
                 font-size: 10px;
                 line-height: 12px;
@@ -2281,6 +2284,11 @@
             }
             body.lyrics-mode .lyrics-display {
                 display: flex;
+            }
+            @media (min-width: 480px) and (min-height: 240px) {
+                body:not(.compact-mode).lyrics-mode.lyrics-both .lyrics-next:not(.is-empty) {
+                    display: -webkit-box;
+                }
             }
             .meta-row {
                 display: flex;
@@ -2718,12 +2726,6 @@
             body.mini-mode .lyrics-current {
                 -webkit-line-clamp: 1;
             }
-            body.mini-mode.lyrics-both .lyrics-display {
-                max-height: 26px;
-            }
-            body.mini-mode.lyrics-both .lyrics-next {
-                display: -webkit-box;
-            }
             body.mini-mode .meta-container {
                 max-width: 140px;
                 flex: 1 1 0;
@@ -2815,7 +2817,7 @@
             body.fluid.compact-mode .track-artist { font-size: calc(10.5px * var(--s, 1)); }
             body.fluid .lyrics-display {
                 max-height: calc(52px * var(--lyrics-s, 1));
-                gap: calc(3px * var(--s, 1));
+                gap: calc(8px * var(--lyrics-s, 1));
             }
             body.fluid .lyrics-current {
                 font-size: calc(13px * var(--lyrics-s, 1));
@@ -2844,9 +2846,6 @@
             }
             body.fluid.mini-mode .lyrics-display {
                 max-height: calc(20px * var(--s, 1));
-            }
-            body.fluid.mini-mode.lyrics-both .lyrics-display {
-                max-height: calc(26px * var(--s, 1));
             }
             body.fluid .time-label { font-size: calc(10px * var(--s, 1)); min-width: calc(26px * var(--s, 1)); }
             body.fluid.compact-mode .time-label { font-size: calc(9.5px * var(--s, 1)); min-width: calc(24px * var(--s, 1)); }
@@ -3072,7 +3071,6 @@
                                 <button class="icon-btn" id="btn-lyrics-compact" title="Show SpicyLyrics" aria-label="Show SpicyLyrics" aria-pressed="false">
                                     ${ICONS.lyrics}
                                 </button>
-                                <button class="lyrics-text-mode" id="btn-lyrics-text-mode-compact" title="Lyrics text: Original (click to cycle)" aria-label="Lyrics text: Original (click to cycle)">Original</button>
                             </div>
                             <button class="icon-btn" id="btn-close-compact" title="Close Mini Player">
                                 ${ICONS.close}
@@ -3218,12 +3216,11 @@
             doc.getElementById("btn-lyrics-compact")
         ].filter(Boolean);
         const lyricsTextModeButtons = [
-            doc.getElementById("btn-lyrics-text-mode"),
-            doc.getElementById("btn-lyrics-text-mode-compact")
+            doc.getElementById("btn-lyrics-text-mode")
         ].filter(Boolean);
         syncLyricsTextModeButton();
         lyricsTextModeButtons.forEach(button => listenPiP(button, "click", () => {
-            if (!lyricsRomanizationAvailable) return;
+            if (currentMode !== "standard" || !lyricsRomanizationAvailable) return;
             const index = LYRICS_TEXT_MODES.indexOf(lyricsTextMode);
             lyricsTextMode = LYRICS_TEXT_MODES[(index + 1) % LYRICS_TEXT_MODES.length];
             doc.body.classList.toggle("lyrics-both", lyricsTextMode === "both");
@@ -3611,6 +3608,7 @@
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         if (currentMode !== "standard") {
+            if (lyricsTextMode === "both") lyricsTextMode = "original";
             doc.body.classList.remove("lyrics-mode", "lyrics-both");
             for (const button of doc.querySelectorAll("#btn-lyrics, #btn-lyrics-compact")) {
                 button.classList.remove("active");
@@ -3830,9 +3828,7 @@
         const title = lyricsRomanizationAvailable
             ? `Lyrics text: ${label} (click to cycle)`
             : "Showing SpicyLyrics' selected text; choose Under each line in SpicyLyrics to switch variants";
-        for (const button of pipWindow.document.querySelectorAll(
-            "#btn-lyrics-text-mode, #btn-lyrics-text-mode-compact"
-        )) {
+        for (const button of pipWindow.document.querySelectorAll("#btn-lyrics-text-mode")) {
             button.disabled = !lyricsRomanizationAvailable;
             button.textContent = text;
             button.title = title;
@@ -3881,6 +3877,30 @@
         return row ? normalizeLyricsText(row.textContent) : "";
     }
 
+    function findVisibleSpicyLyricsLine(lines, content, page) {
+        const viewport = content.querySelector(".simplebar-content-wrapper")
+            || page.querySelector(".LyricsContainer")
+            || content;
+        const viewportRect = viewport.getBoundingClientRect();
+        const viewportHeight = viewport.clientHeight || viewportRect.height;
+        if (viewportHeight <= 0) return null;
+
+        const viewportBottom = viewportRect.top + viewportHeight;
+        const center = viewportRect.top + viewportHeight / 2;
+        let closestLine = null;
+        let closestDistance = Infinity;
+        for (const line of lines) {
+            const rect = line.element.getBoundingClientRect();
+            if (rect.bottom <= viewportRect.top || rect.top >= viewportBottom) continue;
+            const distance = Math.abs((rect.top + rect.bottom) / 2 - center);
+            if (distance < closestDistance) {
+                closestLine = line;
+                closestDistance = distance;
+            }
+        }
+        return closestLine;
+    }
+
     function refreshLyricsAdapter() {
         if (!isPiPWindowOpen() || !pipWindow.document.body.classList.contains("lyrics-mode")) return;
 
@@ -3904,7 +3924,7 @@
                         lyricsRefreshTimerId = window.setTimeout(() => {
                             lyricsRefreshTimerId = null;
                             refreshLyricsAdapter();
-                        }, 90);
+                        }, LYRICS_REFRESH_DEBOUNCE_MS);
                     }
                 });
                 lyricsObserver.observe(content, {
@@ -3946,23 +3966,23 @@
             return;
         }
 
-        const activeIndex = lines.findIndex(line => line.element.classList.contains("Active"));
-        if (activeIndex < 0) {
+        const activeLines = lines.filter(line => line.element.classList.contains("Active"));
+        const active = activeLines.length
+            ? activeLines[activeLines.length - 1]
+            : findVisibleSpicyLyricsLine(lines, content, page);
+        if (!active) {
             renderLyricsSnapshot("...");
             return;
         }
-        const active = lines[activeIndex];
-        const following = lines[activeIndex + 1];
         if (lyricsTextMode === "romanized") {
             renderLyricsSnapshot(
                 "",
-                active.romanized || active.original || "...",
-                following?.romanized || following?.original || ""
+                active.romanized || active.original || "..."
             );
         } else if (lyricsTextMode === "both") {
             renderLyricsSnapshot("", active.original || "...", active.romanized || "");
         } else {
-            renderLyricsSnapshot("", active.original || "...", following?.original || "");
+            renderLyricsSnapshot("", active.original || "...");
         }
     }
 
@@ -3970,7 +3990,7 @@
         stopLyricsAdapter();
         renderLyricsSnapshot("Looking for SpicyLyrics…");
         refreshLyricsAdapter();
-        lyricsPollTimerId = window.setInterval(refreshLyricsAdapter, 1000);
+        lyricsPollTimerId = window.setInterval(refreshLyricsAdapter, LYRICS_POLL_INTERVAL_MS);
     }
 
     function updatePlayPauseButton() {
