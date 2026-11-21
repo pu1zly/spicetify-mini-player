@@ -1,6 +1,6 @@
 # Spicetify Mini Player
 
-An always-on-top, draggable mini player extension for Spotify using Chromium's Document Picture-in-Picture capability. It remains visible and fully responsive even while Spotify is minimized.
+An always-on-top, draggable replacement for Spotify's native mini player, built with Chromium's Document Picture-in-Picture capability. It remains visible and fully responsive even while Spotify is minimized. In the Mini Player settings, toggle **Replace Spotify's mini player** to choose whether Spotify's mini-player button opens this extension or Spotify's original player.
 
 ---
 
@@ -25,7 +25,7 @@ An always-on-top, draggable mini player extension for Spotify using Chromium's D
     <p align="center">
       <img src="assets/mini-mode.png" alt="Mini Mode" />
     </p>
-- **SpicyLyrics Integration**: Mirrors the currently displayed and upcoming lyric lines from SpicyLyrics into the player. Lyrics are available in Standard Mode only. When SpicyLyrics exposes a romanized line, cycle between **Original**, **Romanized**, and **Both**; otherwise, the player shows SpicyLyrics' selected text. For variant switching, set SpicyLyrics to **Under each line**.
+- **SpicyLyrics Integration**: Mirrors the newest active lyric from SpicyLyrics, replacing a previous line even if it is still being sung. If lyrics are unsynced and have no active marker, it mirrors the line nearest the center of SpicyLyrics' scroll view instead of showing an empty placeholder. Lyrics are available in Standard Mode only. Cycle between **Original**, **Romanized**, and **Both** when SpicyLyrics exposes romanization; **Both** puts that line's romanization underneath when the window is large enough. For variant switching, set SpicyLyrics to **Under each line**.
 - **Lyrics That Scale with the Window**: With Dynamic Resizing enabled, lyric text grows with larger window sizes, independently of the rest of the interface, up to 2.5x its base scale.
 - **Dynamic Resizing**: An experimental setting that lets the window resize freely, switches between Mini, Compact, and Standard layouts, scales the interface, and shows a larger album-art layout when tall. A top-bar button can shrink the window back to the largest fixed mode.
 - **Next Up Display**: Shows upcoming queue items in a top bar by reading the queue directly.
