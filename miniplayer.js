@@ -20,8 +20,27 @@
     let lyricsRefreshTimerId = null;
     let lyricsSource = null;
     let lastLyricsSnapshotKey = "";
+    let lyricsTrackUri = "";      // track the lyrics view currently belongs to
+    let lyricsStaleSig = "";      // content signature that was on screen when the track changed
+    let lyricsStaleUntil = 0;     // until then, an unchanged signature means "still the old song"
     let lyricsTextMode = "original";
     let lyricsRomanizationAvailable = false;
+    let episodeVideoSource = null;
+    let episodeVideoStream = null;
+    let episodeVideoUri = "";
+    let failedEpisodeVideoSource = null;
+    let failedEpisodeVideoUri = "";
+    let lastEpisodeVideoWarning = "";
+    // Layout mode and top-bar/queue state. Declared up here, ahead of the functions that read them
+    // (currentMode is assigned from the saved setting once settings have loaded, further down).
+    let currentMode = "standard";
+    let lastUpcomingKey = null;
+    let queueOpen = false;
+    let lastQueueKey = null;
+    let queueMenuEl = null;
+    let queueMenuDisposers = [];
+    let queueRenderDisposers = [];
+    let queueRenderGeneration = 0;
     // Re-evaluates which mini player launcher the playback bar shows (assigned in registerButtons)
     let syncPlaybarButtons = () => {};
     let pipResources = null;
@@ -39,6 +58,7 @@
     const PLAYER_STATE_SYNC_MS = 2500;
     const QUEUE_STATE_SYNC_MS = 1500;
     const WINDOW_POSITION_SYNC_MS = 2500;
+    const EPISODE_VIDEO_SYNC_MS = 500;
     const LYRICS_TEXT_MODES = ["original", "romanized", "both"];
     const LYRICS_TEXT_MODE_LABELS = {
         original: "Original",
@@ -47,6 +67,8 @@
     };
     const LYRICS_POLL_INTERVAL_MS = 100;
     const LYRICS_REFRESH_DEBOUNCE_MS = 40;
+    const LYRICS_STALE_TIMEOUT_MS = 4000;
+    const lyricsLineCache = new WeakMap(); // line element -> parsed text, so unchanged lines are never re-parsed
     let isUserSeeking = false;
     let isAdjustingVolume = false;
     let lastFormattedTime = "";
@@ -181,8 +203,156 @@
         return pipResources.listen(target, type, listener, options);
     }
 
+    function syncPodcastVideoLayout() {
+        if (!isPiPWindowOpen()) return;
+        const active = !!episodeVideoStream
+            && pipWindow.innerWidth >= 690
+            && pipWindow.innerHeight >= 420;
+        pipWindow.document.body.classList.toggle("podcast-video-wide", active);
+    }
+
+    function releaseEpisodeVideo() {
+        if (episodeVideoStream) {
+            episodeVideoStream.getTracks().forEach(track => track.stop());
+            episodeVideoStream = null;
+        }
+        if (isPiPWindowOpen()) {
+            const video = pipWindow.document.getElementById("episode-video");
+            if (video) {
+                video.pause();
+                video.srcObject = null;
+                video.onloadeddata = null;
+            }
+            pipWindow.document.querySelector(".cover-container")?.classList.remove("video-active");
+            pipWindow.document.body.classList.remove("podcast-video-active");
+            pipWindow.document.body.classList.remove("podcast-video-wide");
+        }
+        episodeVideoSource = null;
+    }
+
+    function warnEpisodeVideoCaptureUnavailable(uri, reason) {
+        const key = `${uri}\u0000${reason}`;
+        if (key === lastEpisodeVideoWarning) return;
+        lastEpisodeVideoWarning = key;
+        console.warn(`[MiniPlayer] Podcast video preview unavailable (${reason}); keeping episode art.`);
+        Spicetify.showNotification("Podcast video isn't accessible; showing episode art.", true);
+    }
+
+    function findVisibleSpotifyVideo() {
+        let bestVideo = null;
+        let bestArea = 0;
+        for (const video of document.querySelectorAll("video")) {
+            if (!video.isConnected || video.readyState < 2 || !video.videoWidth || !video.videoHeight) continue;
+            const rect = video.getBoundingClientRect();
+            if (rect.width < 96 || rect.height < 54
+                || rect.bottom <= 0 || rect.right <= 0
+                || rect.top >= window.innerHeight || rect.left >= window.innerWidth) continue;
+            const style = window.getComputedStyle(video);
+            if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) continue;
+            const area = rect.width * rect.height;
+            if (area > bestArea) {
+                bestVideo = video;
+                bestArea = area;
+            }
+        }
+        return bestVideo;
+    }
+
+    function syncEpisodeVideo() {
+        if (!isPiPWindowOpen()) return;
+        const item = playerState.currentTrack;
+        const uri = item?.uri || "";
+        const isEpisode = uri.startsWith("spotify:episode:") || item?.type === "episode";
+        pipWindow.document.body.classList.toggle("podcast-track", isEpisode);
+        if (!isEpisode) {
+            releaseEpisodeVideo();
+            episodeVideoUri = "";
+            failedEpisodeVideoSource = null;
+            failedEpisodeVideoUri = "";
+            return;
+        }
+        if (currentMode !== "standard") {
+            releaseEpisodeVideo();
+            return;
+        }
+        if (episodeVideoUri !== uri) {
+            releaseEpisodeVideo();
+            episodeVideoUri = uri;
+            failedEpisodeVideoSource = null;
+            failedEpisodeVideoUri = "";
+        }
+
+        const source = findVisibleSpotifyVideo();
+        if (!source) {
+            if (episodeVideoSource && !episodeVideoSource.isConnected) releaseEpisodeVideo();
+            return;
+        }
+        if (source === episodeVideoSource && episodeVideoStream) return;
+        if (source === failedEpisodeVideoSource && uri === failedEpisodeVideoUri) return;
+
+        releaseEpisodeVideo();
+        const capture = source.captureStream || source.mozCaptureStream;
+        if (typeof capture !== "function") {
+            failedEpisodeVideoSource = source;
+            failedEpisodeVideoUri = uri;
+            warnEpisodeVideoCaptureUnavailable(uri, "captureStream is unsupported");
+            return;
+        }
+
+        let capturedStream = null;
+        try {
+            capturedStream = capture.call(source);
+            const videoTracks = capturedStream.getVideoTracks();
+            capturedStream.getAudioTracks().forEach(track => track.stop());
+            if (!videoTracks.length || typeof pipWindow.MediaStream !== "function") {
+                capturedStream.getTracks().forEach(track => track.stop());
+                failedEpisodeVideoSource = source;
+                failedEpisodeVideoUri = uri;
+                warnEpisodeVideoCaptureUnavailable(uri, "no usable video track");
+                return;
+            }
+
+            const video = pipWindow.document.getElementById("episode-video");
+            const cover = pipWindow.document.querySelector(".cover-container");
+            if (!video || !cover) {
+                capturedStream.getTracks().forEach(track => track.stop());
+                return;
+            }
+            episodeVideoSource = source;
+            episodeVideoStream = new pipWindow.MediaStream(videoTracks);
+            video.muted = true;
+            video.playsInline = true;
+            video.onloadeddata = () => {
+                if (episodeVideoSource === source && isPiPWindowOpen()) {
+                    cover.classList.add("video-active");
+                    pipWindow.document.body.classList.add("podcast-video-active");
+                    syncPodcastVideoLayout();
+                }
+            };
+            video.srcObject = episodeVideoStream;
+            const playResult = video.play();
+            if (playResult && typeof playResult.catch === "function") {
+                playResult.catch(error => {
+                    if (episodeVideoSource !== source) return;
+                    console.warn("[MiniPlayer] Podcast video preview failed to play:", error);
+                    releaseEpisodeVideo();
+                    failedEpisodeVideoSource = source;
+                    failedEpisodeVideoUri = uri;
+                    warnEpisodeVideoCaptureUnavailable(uri, "captured video could not play");
+                });
+            }
+        } catch (error) {
+            capturedStream?.getTracks().forEach(track => track.stop());
+            failedEpisodeVideoSource = source;
+            failedEpisodeVideoUri = uri;
+            console.warn("[MiniPlayer] Podcast video preview capture failed:", error);
+            warnEpisodeVideoCaptureUnavailable(uri, "capture failed");
+        }
+    }
+
     function cleanupPiPResources() {
         stopLyricsAdapter();
+        releaseEpisodeVideo();
         const resources = pipResources;
         pipResources = null;
         resources?.cleanup();
@@ -330,16 +500,8 @@
         return list.includes(m) ? m : list[0];
     }
 
-    let currentMode = loadMode();
+    currentMode = loadMode();
 
-    // Top bar state: next-up text from the playback queue + the queue button/panel
-    let lastUpcomingKey = null;
-    let queueOpen = false;
-    let lastQueueKey = null;
-    let queueMenuEl = null;
-    let queueMenuDisposers = [];
-    let queueRenderDisposers = [];
-    let queueRenderGeneration = 0;
     // Fixed Dimensions: strictly locked to prevent expansion/stretching
     const STANDARD_WIDTH = 360;
     const STANDARD_HEIGHT = 185;
@@ -377,12 +539,13 @@
         next: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M12.7 1a.7.7 0 0 0-.7.7v5.15L2.05 1.106A.7.7 0 0 0 1 1.712v12.576a.7.7 0 0 0 1.05.607L12 9.149V14.3a.7.7 0 0 0 .7.7h1.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7h-1.6z"/></svg>`,
         shuffle: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.151.922a.75.75 0 1 0-1.06 1.06L13.109 3H11.16a3.75 3.75 0 0 0-2.873 1.34l-6.173 7.356A2.25 2.25 0 0 1 .39 12.5H0V14h.391a3.75 3.75 0 0 0 2.873-1.34l6.173-7.356a2.25 2.25 0 0 1 1.724-.804h1.947l-1.017 1.018a.75.75 0 0 0 1.06 1.06L15.98 3.75 13.15.922zM.391 3.5H0V2h.391c.9 0 1.745.405 2.308 1.077l1.724 2.056-.99.832L1.936 4.195A2.25 2.25 0 0 0 .39 3.5zm12.76 7.422a.75.75 0 0 1 1.06 1.06L11.39 14.805a.75.75 0 0 1-1.06-1.06l1.439-1.439h-1.61a3.75 3.75 0 0 1-2.872-1.34l-1.724-2.056.99-.832 1.498 1.787a2.25 2.25 0 0 0 1.724.805h1.948l-1.439-1.44z"/></svg>`,
         repeat: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 4.75A3.75 3.75 0 0 1 3.75 1h8.5A3.75 3.75 0 0 1 16 4.75v5a3.75 3.75 0 0 1-3.75 3.75H9.81l1.018 1.018a.75.75 0 1 1-1.06 1.06L6.939 12.75l2.829-2.828a.75.75 0 1 1 1.06 1.06L9.811 12h2.439a2.25 2.25 0 0 0 2.25-2.25v-5a2.25 2.25 0 0 0-2.25-2.25h-8.5A2.25 2.25 0 0 0 1.5 4.75v5A2.25 2.25 0 0 0 3.75 12H5v1.5H3.75A3.75 3.75 0 0 1 0 9.75v-5z"/></svg>`,
-        volumeHigh: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M9.741.85a.75.75 0 0 1 .375.65v13a.75.75 0 0 1-1.125.65l-6.925-4H0V4.85h2.066l6.925-4a.75.75 0 0 1 .75 0zM11.5 5.5a.75.75 0 0 1 .75-.75 4.5 4.5 0 0 1 0 6.5.75.75 0 1 1-1.06-1.06 3 3 0 0 0 0-4.38.75.75 0 0 1 .31-.31zm2.5-2.5a.75.75 0 0 1 .75-.75 8 8 0 0 1 0 11.5.75.75 0 1 1-1.06-1.06 6.5 6.5 0 0 0 0-9.38.75.75 0 0 1 .31-.31z"/></svg>`,
-        volumeMute: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.86 5.47a.75.75 0 0 0-1.061 0l-1.47 1.47-1.47-1.47A.75.75 0 0 0 8.8 6.53L10.269 8l-1.47 1.47a.75.75 0 1 0 1.06 1.06l1.47-1.47 1.47 1.47a.75.75 0 0 0 1.06-1.06L12.39 8l1.47-1.47a.75.75 0 0 0 0-1.06zM9.741.85a.75.75 0 0 1 .375.65v13a.75.75 0 0 1-1.125.65l-6.925-4H0V4.85h2.066l6.925-4a.75.75 0 0 1 .75 0z"/></svg>`,
+        volumeHigh: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/></svg>`,
+        volumeMedium: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/></svg>`,
+        volumeMute: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.7.7 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.7.7 0 0 0 11 19.298z"/><path d="m16.5 14.5 5-5"/><path d="m16.5 9.5 5 5"/></svg>`,
         compact: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M1.5 1h13A1.5 1.5 0 0 1 16 2.5v11a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 13.5v-11A1.5 1.5 0 0 1 1.5 1zm0 1.5a.5.5 0 0 0-.5.5v2h14V3a.5.5 0 0 0-.5-.5h-13zM15 6H1v7.5a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5V6z"/></svg>`,
         expand: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M2.5 1A1.5 1.5 0 0 0 1 2.5v11A1.5 1.5 0 0 0 2.5 15h11a1.5 1.5 0 0 0 1.5-1.5v-11A1.5 1.5 0 0 0 13.5 1h-11zm0 1.5h11a.5.5 0 0 1 .5.5v11a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5z"/></svg>`,
         close: `<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8 2.146 2.854z"/></svg>`,
-        lyrics: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M2 2.75A.75.75 0 0 1 2.75 2h10.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 2.75zm0 4A.75.75 0 0 1 2.75 6h10.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 6.75zm0 4A.75.75 0 0 1 2.75 10h7.5a.75.75 0 0 1 0 1.5h-7.5A.75.75 0 0 1 2 10.75z"/></svg>`
+        lyrics: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m11 7.601-5.994 8.19a1 1 0 0 0 .1 1.298l.817.818a1 1 0 0 0 1.314.087L15.09 12"/><path d="M16.5 21.174C15.5 20.5 14.372 20 13 20c-2.058 0-3.928 2.356-6 2-2.072-.356-2.775-3.369-1.5-4.5"/><circle cx="16" cy="7" r="5"/></svg>`
     };
 
     // The icon shown for each mode (the cover / mode button shows the mode you'd switch TO)
@@ -410,6 +573,19 @@
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         const next = nextMode();
+        const item = playerState.currentTrack;
+        const isEpisode = item?.uri?.startsWith("spotify:episode:")
+            || item?.type === "episode";
+        const canExpandPodcast = settings.dynamicResize
+            && isEpisode
+            && (pipWindow.innerWidth < 690 || pipWindow.innerHeight < 420);
+        if (canExpandPodcast) {
+            const title = "Expand podcast video";
+            doc.querySelector(".cover-container")?.setAttribute("title", title);
+            const modeIcon = doc.getElementById("cover-mode-icon");
+            if (modeIcon) modeIcon.innerHTML = ICONS.expand;
+            return;
+        }
         // Only one usable mode: nothing to switch to, so hide the switch affordances
         doc.body.classList.toggle("single-mode", next === currentMode || !!settings.dynamicResize);
         const tip = `Switch to ${MODE_LABELS[next]} mode`;
@@ -658,7 +834,7 @@
 
         section("Spotify integration");
         row("Replace Spotify's mini player",
-            "Spotify's own mini player button opens this player instead. Turn off to restore Spotify's native mini player. "
+            "Spotify's own and SpicyLyrics' Open in Miniplayer buttons, including episode video controls, open this player instead. Turn off to restore Spotify's native mini player. "
             + (findNativeMiniplayerButtons().length > 0
                 ? "Spotify's button detected."
                 : "Spotify's button wasn't found (Spotify may have changed it), so this extension's own playbar button is shown instead."),
@@ -892,6 +1068,8 @@
         if (!isPiPWindowOpen() || !settings.dynamicResize || queueOpen) return;
         const state = fluidState();
         const doc = pipWindow.document;
+        syncPodcastVideoLayout();
+        refreshModeUi();
         const w = pipWindow.innerWidth;
         // Under 74px tall the top bar would leave the card less than the 48px Mini needs, so the bar steps aside
         const slim = pipWindow.innerHeight < UPCOMING_BAR_HEIGHT + MINI_HEIGHT;
@@ -979,6 +1157,23 @@
         } catch (err) {
             console.warn("[MiniPlayer] Unable to shrink the window:", err);
             Spicetify.showNotification("Couldn't resize the window", true);
+        }
+    }
+
+    function expandPodcastVideoPreview() {
+        if (!isPiPWindowOpen() || !settings.dynamicResize) return false;
+        const item = playerState.currentTrack;
+        const isEpisode = item?.uri?.startsWith("spotify:episode:")
+            || item?.type === "episode";
+        if (!isEpisode) return false;
+        if (pipWindow.innerWidth >= 690 && pipWindow.innerHeight >= 420) return false;
+        try {
+            pipWindow.resizeTo(690 + pipWindowFrameWidth, 420 + pipWindowFrameHeight);
+            return true;
+        } catch (err) {
+            console.warn("[MiniPlayer] Unable to expand the podcast video:", err);
+            Spicetify.showNotification("Couldn't expand the podcast video", true);
+            return false;
         }
     }
 
@@ -1416,6 +1611,7 @@
         if (!force && key === lastQueueKey) return;
         lastQueueKey = key;
         closeQueueMenu(); // the row it belonged to is about to be rebuilt
+        const hasQueuedItems = items.some(item => item.fromQueue);
 
         const scrollTop = list.scrollTop;
         queueRenderDisposers.forEach(dispose => dispose?.());
@@ -1441,7 +1637,8 @@
             for (; index < end; index++) {
                 const it = items[index];
                 const group = it.fromQueue ? "Next in queue" : "Next up";
-                if (currentMode === "standard" && group !== lastGroup) {
+                if (currentMode === "standard" && group !== lastGroup
+                    && (group !== "Next up" || hasQueuedItems)) {
                     const heading = doc.createElement("div");
                     heading.className = "queue-group";
                     heading.textContent = group;
@@ -1620,6 +1817,9 @@
 
             // Player state sync is separate from the queue and window-position polling.
             pipResources.setInterval(syncPlayerStateTick, PLAYER_STATE_SYNC_MS);
+            pipResources.setInterval(() => {
+                if (!pipWindow.document.hidden) syncEpisodeVideo();
+            }, EPISODE_VIDEO_SYNC_MS);
             // Queue polling: the top bar only needs the first item, and podcast shows can have thousands of
             // queued episodes, so poll less often for them (and not at all while the window is hidden)
             let queueTick = 0;
@@ -1700,6 +1900,20 @@
         return !!label && NATIVE_MINIPLAYER_LABELS.includes(label);
     }
 
+    function isOpenMiniplayerButton(el) {
+        if (!el) return false;
+        const labels = [
+            el.getAttribute("aria-label"),
+            el.getAttribute("title"),
+            el.getAttribute("data-tooltip"),
+            el.textContent
+        ];
+        return labels.some(value => {
+            const label = (value || "").toLowerCase().replace(/[^a-z]/g, "");
+            return label === "openinminiplayer" || label === "openinminplayer";
+        });
+    }
+
     function findNativeMiniplayerButtons(scope = null) {
         try {
             // Never fall back to document: episode pages can contain hundreds of unrelated playback controls.
@@ -1736,13 +1950,12 @@
                 align-items: center;
                 justify-content: center;
             }
+            /* Top bar, card and queue stay in normal flow (top-aligned) so opening/closing the queue
+               doesn't redistribute free space. */
             body {
                 flex-direction: column;
-                position: relative;
-            }
-            /* Keep the top bar and card in normal flow so queue open/close doesn't redistribute free space. */
-            body {
                 justify-content: flex-start;
+                position: relative;
             }
             .player-surface {
                 position: relative;
@@ -2181,9 +2394,23 @@
                 display: block;
                 -webkit-user-drag: none;
             }
+            .episode-video {
+                display: none;
+                position: absolute;
+                z-index: 1;
+                inset: 0;
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+                background: #000000;
+                pointer-events: none;
+            }
+            .cover-container.video-active .episode-video { display: block; }
+            .cover-container.video-active .cover-art { visibility: hidden; }
             /* Hover overlay on the cover: dims the art and shows the mode-switch icon */
             .cover-overlay {
                 position: absolute;
+                z-index: 2;
                 inset: 0;
                 display: flex;
                 align-items: center;
@@ -2245,6 +2472,9 @@
             body.lyrics-mode .lyrics-text-mode {
                 display: inline-flex;
             }
+            .lyrics-text-mode.unavailable {
+                display: none !important;
+            }
             .lyrics-text-mode:hover {
                 background: rgba(255, 255, 255, 0.18);
                 color: #ffffff;
@@ -2285,7 +2515,24 @@
             body.lyrics-mode .lyrics-display {
                 display: flex;
             }
-            @media (min-width: 480px) and (min-height: 240px) {
+            .lyrics-source {
+                display: inline-flex;
+                width: 70px;
+                align-items: center;
+                overflow: hidden;
+                color: rgba(255, 255, 255, 0.42);
+                font-size: 7.5px;
+                font-weight: 600;
+                line-height: 1;
+                letter-spacing: 0.15px;
+                white-space: nowrap;
+                visibility: hidden;
+                pointer-events: none;
+            }
+            body.lyrics-mode .lyrics-source {
+                visibility: visible;
+            }
+            @media (min-height: 240px) {
                 body:not(.compact-mode).lyrics-mode.lyrics-both .lyrics-next:not(.is-empty) {
                     display: -webkit-box;
                 }
@@ -2384,12 +2631,19 @@
                 display: flex;
                 align-items: center;
                 gap: 8px;
-                margin: 4px 0 2px 0;
+                margin: 2px 0 2px 0;
+            }
+            body.fluid.podcast-video-wide:not(.compact-mode):not(.mini-mode) .progress-section {
+                margin-top: 10px;
+            }
+            body.fluid.art-layout:not(.podcast-video-wide) .progress-section {
+                transform: translateY(-8px);
             }
             .time-label {
                 font-size: 10px;
                 color: #a7a7a7;
                 font-variant-numeric: tabular-nums;
+                white-space: nowrap; /* long-form audio: never wrap 1:23:45 */
                 min-width: 26px;
                 text-align: center;
             }
@@ -2644,9 +2898,6 @@
                 transition: opacity 0.22s ease, transform 0.22s ease, visibility 0s;
             }
             /* Timeline fades out while the volume row is showing, and back in afterwards */
-            body.compact-mode .progress-section {
-                transition: opacity 0.22s ease;
-            }
             body.compact-mode.volume-open .progress-section {
                 opacity: 0;
                 pointer-events: none;
@@ -2682,6 +2933,7 @@
                 gap: 6px;
                 width: 100%;
                 height: 14px;
+                transition: opacity 0.22s ease;
             }
             body.compact-mode .time-label {
                 font-size: 9.5px;
@@ -2710,12 +2962,20 @@
                 padding: 8px 10px;
                 gap: 0;
             }
-            body.mini-mode .cover-container,
             body.mini-mode .track-artist,
             body.compact-mode.mini-mode .progress-section,
             body.mini-mode .volume-popup,
             body.mini-mode #btn-volume-compact {
                 display: none !important;
+            }
+            body.mini-mode:not(.podcast-track) .cover-container {
+                display: none !important;
+            }
+            body.mini-mode.podcast-track .cover-container {
+                display: block !important;
+                width: 24px;
+                height: 24px;
+                border-radius: 4px;
             }
             body.mini-mode .lyrics-display {
                 max-height: 20px;
@@ -2886,7 +3146,17 @@
                 column-gap: calc(10px * var(--s, 1));
                 align-items: center;
             }
+            /* Keep podcast art out of grid auto-placement so it can't create a second row. */
+            body.fluid.ctr-controls.mini-mode.podcast-track .track-section { position: relative; }
+            body.fluid.ctr-controls.mini-mode.podcast-track .cover-container {
+                position: absolute;
+                z-index: 1;
+                left: 0;
+                top: 50%;
+                transform: translateY(-50%);
+            }
             body.fluid.ctr-controls.mini-mode .meta-container { grid-column: 1; grid-row: 1; }
+            body.fluid.ctr-controls.mini-mode.podcast-track .meta-container { margin-left: calc(30px * var(--s, 1)); }
             body.fluid.ctr-controls.mini-mode .compact-actions-cluster .playback-controls { grid-column: 2; grid-row: 1; margin: 0; }
             body.fluid.ctr-controls.mini-mode .compact-actions-cluster .window-actions { grid-column: 3; grid-row: 1; justify-self: end; }
             /* Narrow Standard / art layout: the speaker opens the same volume row as Compact, in place of the controls */
@@ -2919,8 +3189,7 @@
             body.fluid.mini-vol.mini-mode .volume-popup { display: flex !important; top: calc(50% - 9px); bottom: auto; }
             body.fluid.mini-vol.mini-mode .track-section { transition: opacity 0.22s ease; }
             body.fluid.mini-vol.mini-mode.volume-open .track-section { opacity: 0; pointer-events: none; }
-            /* Long-form audio (episodes, audiobooks): never wrap the time, and widen the labels for 1:23:45 */
-            .time-label { white-space: nowrap; }
+            /* Long-form audio (episodes, audiobooks): widen the labels for 1:23:45 */
             body .miniplayer-card.long-form .time-label { min-width: calc(40px * var(--s, 1)); }
             /* Shrink button (top bar): only while the window is much bigger than the biggest enabled mode */
             .shrink-btn { display: none; margin-left: auto; }
@@ -2967,6 +3236,63 @@
             body.fluid.art-layout .meta-row { width: 100%; }
             body.fluid.art-layout .track-title-wrapper { text-align: center; }
             body.fluid.art-layout .track-artist { max-width: 100%; }
+            /* Active podcast video gets a larger landscape frame; regular cover art stays square.
+               Video is only captured in Standard mode (see syncEpisodeVideo), so Compact and Mini keep their
+               normal cover size, including the moment right after a mode switch. */
+            .cover-container.video-active { width: 110px; height: 62px; }
+            body.fluid .cover-container.video-active {
+                width: calc(110px * var(--s, 1));
+                height: calc(62px * var(--s, 1));
+            }
+            body.fluid.art-layout .cover-container.video-active {
+                width: calc(var(--art, 120px) * 2.14);
+                height: calc(var(--art, 120px) * 1.2);
+            }
+            body.compact-mode:not(.mini-mode) .cover-container.video-active { width: 42px; height: 42px; }
+            body.fluid.compact-mode:not(.mini-mode) .cover-container.video-active {
+                width: calc(42px * var(--s, 1));
+                height: calc(42px * var(--s, 1));
+            }
+            body.compact-mode .cover-container.video-active .episode-video,
+            body.mini-mode .cover-container.video-active .episode-video { display: none !important; }
+            body.compact-mode .cover-container.video-active .cover-art,
+            body.mini-mode .cover-container.video-active .cover-art { visibility: visible !important; }
+            body.fluid.mini-mode.podcast-track .cover-container {
+                width: calc(24px * var(--s, 1));
+                height: calc(24px * var(--s, 1));
+            }
+            .cover-container.video-active ~ .meta-container { margin-top: calc(3px * var(--s, 1)); }
+            .cover-container.video-active ~ .meta-container .track-title { font-size: calc(11.5px * var(--s, 1)); }
+            .cover-container.video-active ~ .meta-container .track-artist { font-size: calc(9.5px * var(--s, 1)); }
+            body.fluid.art-layout .cover-container.video-active ~ .meta-container {
+                margin-top: calc(6px * var(--s, 1));
+            }
+            @media (max-width: 689px), (max-height: 419px) {
+                body.podcast-video-active .cover-container.video-active .episode-video { display: none !important; }
+                body.podcast-video-active .cover-container.video-active .cover-art { visibility: visible !important; }
+                body.podcast-video-active .cover-container.video-active { width: 52px; height: 52px; }
+                body.podcast-video-active.compact-mode .cover-container.video-active { width: 42px; height: 42px; }
+                body.podcast-video-active.mini-mode.podcast-track .cover-container.video-active { width: 24px; height: 24px; }
+                body.podcast-video-active.fluid .cover-container.video-active {
+                    width: calc(52px * var(--s, 1));
+                    height: calc(52px * var(--s, 1));
+                }
+                body.podcast-video-active.fluid.compact-mode .cover-container.video-active {
+                    width: calc(42px * var(--s, 1));
+                    height: calc(42px * var(--s, 1));
+                }
+                body.podcast-video-active.fluid.mini-mode.podcast-track .cover-container.video-active {
+                    width: calc(24px * var(--s, 1));
+                    height: calc(24px * var(--s, 1));
+                }
+                body.podcast-video-active.fluid.art-layout .cover-container.video-active {
+                    width: var(--art, 120px);
+                    height: var(--art, 120px);
+                }
+                body.podcast-video-active.fluid.ctr-controls.compact-mode:not(.mini-mode) .track-section {
+                    grid-template-columns: calc(42px * var(--s, 1)) minmax(0, 1fr) auto minmax(0, 1fr) calc(42px * var(--s, 1));
+                }
+            }
             .volume-toast.show {
                 opacity: 1;
                 transform: translate(-50%, -50%);
@@ -3009,10 +3335,11 @@
                     </div>
                     <div class="window-actions">
                         <div class="lyrics-action-group">
+                            <span class="lyrics-source" id="lyrics-source"></span>
+                            <button class="lyrics-text-mode" id="btn-lyrics-text-mode" title="Lyrics text: Original (click to cycle)" aria-label="Lyrics text: Original (click to cycle)">Original</button>
                             <button class="icon-btn" id="btn-lyrics" title="Show SpicyLyrics" aria-label="Show SpicyLyrics" aria-pressed="false">
                                 ${ICONS.lyrics}
                             </button>
-                            <button class="lyrics-text-mode" id="btn-lyrics-text-mode" title="Lyrics text: Original (click to cycle)" aria-label="Lyrics text: Original (click to cycle)">Original</button>
                         </div>
                         <button class="icon-btn" id="btn-close" title="Close Mini Player">
                             ${ICONS.close}
@@ -3024,6 +3351,7 @@
                 <div class="track-section">
                     <div class="cover-container" title="Switch mode">
                         <img id="cover-img" class="cover-art" src="" alt="Album Art" />
+                        <video id="episode-video" class="episode-video" muted playsinline aria-hidden="true"></video>
                         <div class="cover-overlay" id="cover-mode-icon">${MODE_ICONS[nextMode()]}</div>
                     </div>
                     <div class="meta-container">
@@ -3208,6 +3536,7 @@
         });
         listenPiP(coverContainer, "click", (e) => {
             if (Math.abs(e.screenX - coverDownX) > 4 || Math.abs(e.screenY - coverDownY) > 4) return;
+            if (expandPodcastVideoPreview()) return;
             toggleMode();
         });
 
@@ -3714,6 +4043,22 @@
         }
     }
 
+    // Artist names as individual links (one per artist), or plain text when there are no artist URIs
+    function appendArtistLinks(doc, parent, meta) {
+        if (!meta.artistList.length) {
+            parent.appendChild(doc.createTextNode(meta.artist));
+            return;
+        }
+        meta.artistList.forEach((a, i) => {
+            if (i > 0) parent.appendChild(doc.createTextNode(", "));
+            const span = doc.createElement("span");
+            span.className = "artist-link" + (a.uri ? " linkable" : "");
+            span.textContent = a.name;
+            if (a.uri) span.dataset.uri = a.uri;
+            parent.appendChild(span);
+        });
+    }
+
     function renderFullUI() {
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
@@ -3738,36 +4083,14 @@
                 const artistInline = doc.createElement("span");
                 artistInline.className = "track-artist-inline";
                 artistInline.appendChild(doc.createTextNode(" \u00b7 "));
-                if (meta.artistList.length) {
-                    meta.artistList.forEach((a, i) => {
-                        if (i > 0) artistInline.appendChild(doc.createTextNode(", "));
-                        const span = doc.createElement("span");
-                        span.className = "artist-link" + (a.uri ? " linkable" : "");
-                        span.textContent = a.name;
-                        if (a.uri) span.dataset.uri = a.uri;
-                        artistInline.appendChild(span);
-                    });
-                } else {
-                    artistInline.appendChild(doc.createTextNode(meta.artist));
-                }
+                appendArtistLinks(doc, artistInline, meta);
                 titleEl.appendChild(artistInline);
             }
         }
         if (artistEl) {
             artistEl.title = meta.artist;
             artistEl.textContent = "";
-            if (meta.artistList.length) {
-                meta.artistList.forEach((a, i) => {
-                    if (i > 0) artistEl.appendChild(doc.createTextNode(", "));
-                    const span = doc.createElement("span");
-                    span.className = "artist-link" + (a.uri ? " linkable" : "");
-                    span.textContent = a.name;
-                    if (a.uri) span.dataset.uri = a.uri;
-                    artistEl.appendChild(span);
-                });
-            } else {
-                artistEl.textContent = meta.artist;
-            }
+            appendArtistLinks(doc, artistEl, meta);
         }
 
         updateMarqueeEffect();
@@ -3775,16 +4098,19 @@
         // Cover Art & Ambient BG
         const coverEl = doc.getElementById("cover-img");
         const ambientBg = doc.getElementById("ambient-bg");
-        if (coverEl) {
-            if (meta.cover) {
+        const coverUrl = meta.cover || "";
+        if (coverEl && coverEl.dataset.src !== coverUrl) {
+            coverEl.dataset.src = coverUrl;
+            if (coverUrl) {
                 // @ts-ignore
-                coverEl.src = meta.cover;
+                coverEl.src = coverUrl;
             } else {
                 coverEl.removeAttribute("src");
             }
         }
-        if (ambientBg) {
-            ambientBg.style.backgroundImage = meta.cover ? `url("${meta.cover}")` : "none";
+        if (ambientBg && ambientBg.dataset.src !== coverUrl) {
+            ambientBg.dataset.src = coverUrl;
+            ambientBg.style.backgroundImage = coverUrl ? `url("${coverUrl}")` : "none";
         }
 
         // Duration Label
@@ -3802,6 +4128,7 @@
 
         // Volume
         updateVolumeUI();
+        syncEpisodeVideo();
     }
 
     function stopLyricsAdapter() {
@@ -3817,19 +4144,24 @@
         lyricsObserver = null;
         lyricsSource = null;
         lastLyricsSnapshotKey = "";
+        lyricsTrackUri = "";
+        lyricsStaleSig = "";
+        lyricsStaleUntil = 0;
         lyricsRomanizationAvailable = false;
         syncLyricsTextModeButton();
+        setLyricsSourceLabel("");
     }
 
     function syncLyricsTextModeButton() {
         if (!isPiPWindowOpen()) return;
         const label = LYRICS_TEXT_MODE_LABELS[lyricsTextMode];
-        const text = lyricsRomanizationAvailable ? label : "Source";
+        const text = lyricsRomanizationAvailable ? label : "";
         const title = lyricsRomanizationAvailable
             ? `Lyrics text: ${label} (click to cycle)`
             : "Showing SpicyLyrics' selected text; choose Under each line in SpicyLyrics to switch variants";
         for (const button of pipWindow.document.querySelectorAll("#btn-lyrics-text-mode")) {
             button.disabled = !lyricsRomanizationAvailable;
+            button.classList.toggle("unavailable", !lyricsRomanizationAvailable);
             button.textContent = text;
             button.title = title;
             button.setAttribute("aria-label", title);
@@ -3849,6 +4181,12 @@
         currentEl.textContent = current || status;
         nextEl.textContent = next;
         nextEl.classList.toggle("is-empty", !next);
+    }
+
+    function setLyricsSourceLabel(source = "") {
+        if (!isPiPWindowOpen()) return;
+        const label = pipWindow.document.getElementById("lyrics-source");
+        if (label) label.textContent = source ? `Source: ${source}` : "";
     }
 
     function normalizeLyricsText(text) {
@@ -3901,6 +4239,218 @@
         return closestLine;
     }
 
+    function getLyricsLineData(element) {
+        const raw = element.textContent || "";
+        const cached = lyricsLineCache.get(element);
+        if (cached && cached.raw === raw) return cached.data;
+        const data = {
+            element,
+            original: getSpicyLyricsLineText(element),
+            romanized: getSpicyLyricsRomanizedText(element)
+        };
+        lyricsLineCache.set(element, { raw, data });
+        return data;
+    }
+
+    // Cheap fingerprint of the lyrics on screen (line count + first/last line), used to tell
+    // "SpicyLyrics still shows the previous song" from "the new lyrics have arrived"
+    function getLyricsContentSig(content) {
+        const els = content.querySelectorAll(".line");
+        if (!els.length) return "0";
+        return `${els.length}|${(els[0].textContent || "").slice(0, 40)}|${(els[els.length - 1].textContent || "").slice(0, 40)}`;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // LRCLIB fallback: synced lyrics from lrclib.net (free, no API key) when SpicyLyrics can't supply
+    // them (page closed, still loading, or no lyrics). The active line is computed from our own
+    // playback clock, so SpicyLyrics doesn't have to be open at all.
+    // ---------------------------------------------------------------------------------------------
+    const LRCLIB_API = "https://lrclib.net/api";
+    const LRCLIB_STORE_KEY = "miniplayer_lrclib_v1";
+    const LRCLIB_MAX_ENTRIES = 60;           // cached songs kept in localStorage (oldest dropped first)
+    const LRCLIB_MISS_TTL_MS = 12 * 3600e3;  // "no synced lyrics" answers are re-checked after 12 h
+    const LRCLIB_ERROR_RETRY_MS = 30000;     // network failures are retried after 30 s
+    const LRCLIB_TIMEOUT_MS = 7000;
+    const LRCLIB_OFFSET_MS = 150;            // show lines slightly early: covers the poll interval + reading time
+    const lrclibRuntime = new Map();         // uri -> { state: "loading" | "error", at }
+    let lrclibStore = null;
+
+    function lrclibLoadStore() {
+        if (lrclibStore) return lrclibStore;
+        try { lrclibStore = JSON.parse(localStorage.getItem(LRCLIB_STORE_KEY) || "{}") || {}; }
+        catch (e) { lrclibStore = {}; }
+        return lrclibStore;
+    }
+
+    function lrclibSaveStore() {
+        const store = lrclibLoadStore();
+        const keys = Object.keys(store);
+        if (keys.length > LRCLIB_MAX_ENTRIES) {
+            keys.sort((a, b) => (store[a].t || 0) - (store[b].t || 0))
+                .slice(0, keys.length - LRCLIB_MAX_ENTRIES)
+                .forEach(key => delete store[key]);
+        }
+        try { localStorage.setItem(LRCLIB_STORE_KEY, JSON.stringify(store)); } catch (e) {}
+    }
+
+    // "[01:23.45] text" (also several stamps per line and 2/3-digit fractions) -> sorted [[ms, text], ...]
+    function parseLrc(text) {
+        const out = [];
+        for (const raw of String(text || "").split(/\r?\n/)) {
+            const stamps = Array.from(raw.matchAll(/\[(\d+):(\d{2})(?:[.:](\d{1,3}))?\]/g));
+            if (!stamps.length) continue;
+            const lyric = raw
+                .replace(/\[[^\]]*\]/g, "")
+                .replace(/<\d+:\d+(?:[.:]\d+)?>/g, "") // enhanced-LRC word stamps
+                .replace(/\s+/g, " ")
+                .trim();
+            for (const m of stamps) {
+                const frac = m[3] ? parseInt(m[3].padEnd(3, "0").slice(0, 3), 10) : 0;
+                out.push([Number(m[1]) * 60000 + Number(m[2]) * 1000 + frac, lyric]);
+            }
+        }
+        return out.sort((a, b) => a[0] - b[0]);
+    }
+
+    function cleanTitleForSearch(title) {
+        return String(title || "")
+            .replace(/\s*[-\u2013]\s*(remaster(ed)?|\d{4}\b|live|mono|stereo|single version|radio edit|deluxe|bonus).*$/i, "")
+            .replace(/\s*[(\[](feat|ft|with)\b[^)\]]*[)\]]/ig, "")
+            .trim();
+    }
+
+    async function lrclibGetJson(url) {
+        const ctl = new AbortController();
+        const timer = window.setTimeout(() => ctl.abort(), LRCLIB_TIMEOUT_MS);
+        try {
+            const res = await fetch(url, { signal: ctl.signal });
+            if (res.status === 404) return null;
+            if (!res.ok) throw new Error(`LRCLIB HTTP ${res.status}`);
+            return await res.json();
+        } catch (err) {
+            // Some Spotify builds restrict fetch() to known hosts: retry through Spotify's own HTTP client
+            if (Spicetify.CosmosAsync?.get && !(err && err.name === "AbortError")) {
+                try { return await Spicetify.CosmosAsync.get(url); }
+                catch (cosmosErr) {
+                    if (cosmosErr && (cosmosErr.status === 404 || /404/.test(String(cosmosErr.message || cosmosErr)))) return null;
+                    throw cosmosErr;
+                }
+            }
+            throw err;
+        } finally {
+            window.clearTimeout(timer);
+        }
+    }
+
+    function lrclibQueryFor(item) {
+        const md = item.metadata || {};
+        return {
+            title: item.name || md.title || "",
+            artist: (item.artists && item.artists[0]?.name) || md.artist_name || "",
+            album: item.album?.name || md.album_title || "",
+            durationSec: Math.round((item.duration?.milliseconds || Spicetify.Player.getDuration() || 0) / 1000)
+        };
+    }
+
+    // Exact lookup first, then looser searches; the closest duration wins (a wrong cut is worse than none)
+    async function lrclibLookup(q) {
+        const usable = (r) => r && (r.instrumental || r.syncedLyrics);
+        const closest = (list) => {
+            const ok = (Array.isArray(list) ? list : []).filter(usable);
+            if (!ok.length) return null;
+            if (!q.durationSec) return ok[0];
+            ok.sort((a, b) => Math.abs((a.duration || 0) - q.durationSec) - Math.abs((b.duration || 0) - q.durationSec));
+            return Math.abs((ok[0].duration || 0) - q.durationSec) <= 5 ? ok[0] : null;
+        };
+        const qs = (o) => new URLSearchParams(o).toString();
+
+        let hit = await lrclibGetJson(`${LRCLIB_API}/get?${qs({
+            track_name: q.title, artist_name: q.artist, album_name: q.album, duration: String(q.durationSec)
+        })}`);
+        if (usable(hit)) return hit;
+
+        const cleaned = cleanTitleForSearch(q.title);
+        hit = closest(await lrclibGetJson(`${LRCLIB_API}/search?${qs({ track_name: q.title, artist_name: q.artist })}`));
+        if (hit) return hit;
+        if (cleaned && cleaned !== q.title) {
+            hit = closest(await lrclibGetJson(`${LRCLIB_API}/search?${qs({ track_name: cleaned, artist_name: q.artist })}`));
+            if (hit) return hit;
+        }
+        return closest(await lrclibGetJson(`${LRCLIB_API}/search?${qs({ q: `${cleaned || q.title} ${q.artist}`.trim() })}`));
+    }
+
+    async function lrclibFetchFor(item) {
+        const uri = item.uri;
+        lrclibRuntime.set(uri, { state: "loading", at: Date.now() });
+        try {
+            const hit = await lrclibLookup(lrclibQueryFor(item));
+            const store = lrclibLoadStore();
+            if (hit && hit.instrumental) store[uri] = { t: Date.now(), ins: true };
+            else if (hit && hit.syncedLyrics) {
+                const lines = parseLrc(hit.syncedLyrics);
+                store[uri] = lines.length ? { t: Date.now(), lines } : { t: Date.now(), lines: null };
+            } else store[uri] = { t: Date.now(), lines: null };
+            lrclibSaveStore();
+            lrclibRuntime.delete(uri);
+        } catch (err) {
+            console.warn("[MiniPlayer] LRCLIB lookup failed:", err);
+            lrclibRuntime.set(uri, { state: "error", at: Date.now() });
+        }
+        if (Spicetify.Player.data?.item?.uri === uri) refreshLyricsAdapter(); // paint as soon as it lands
+    }
+
+    // -> { state: "ready" | "loading" | "none", lines?, instrumental? } for the track playing right now
+    function getLrclibForCurrentTrack() {
+        const item = Spicetify.Player.data?.item;
+        const uri = item?.uri || "";
+        if (!uri || uri.startsWith("spotify:episode:") || item.type === "episode") return { state: "none" };
+
+        const entry = lrclibLoadStore()[uri];
+        if (entry) {
+            if (entry.ins) return { state: "ready", lines: [], instrumental: true };
+            if (entry.lines && entry.lines.length) return { state: "ready", lines: entry.lines };
+            if (Date.now() - (entry.t || 0) < LRCLIB_MISS_TTL_MS) return { state: "none" };
+        }
+        const run = lrclibRuntime.get(uri);
+        if (run) {
+            if (run.state === "loading") return { state: "loading" };
+            if (Date.now() - run.at < LRCLIB_ERROR_RETRY_MS) return { state: "none" };
+        }
+        lrclibFetchFor(item);
+        return { state: "loading" };
+    }
+
+    function lrclibLineIndexAt(lines, ms) {
+        let lo = 0, hi = lines.length - 1, idx = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (lines[mid][0] <= ms) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        return idx;
+    }
+
+    let lyricsLrclibLoading = false; // LRCLIB lookup in flight for the current track
+
+    function renderLrclibLine(lrc) {
+        setLyricsSourceLabel("LRCLIB");
+        if (lrc.instrumental) {
+            renderLyricsSnapshot("\u266a Instrumental");
+            return;
+        }
+        const idx = lrclibLineIndexAt(lrc.lines, getPlaybackProgress() + LRCLIB_OFFSET_MS);
+        const current = idx >= 0 ? lrc.lines[idx][1] : "";
+        const next = lyricsTextMode === "both" ? (lrc.lines[idx + 1]?.[1] || "") : "";
+        renderLyricsSnapshot("", current || "\u266a", next);
+    }
+
+    // Status text for when neither source has lines (LRCLIB is always tried first, in refreshLyricsAdapter)
+    function renderLyricsFallback(status) {
+        lyricsRomanizationAvailable = false;
+        syncLyricsTextModeButton();
+        setLyricsSourceLabel("");
+        renderLyricsSnapshot(lyricsLrclibLoading ? "Loading lyrics\u2026" : status);
+    }
+
     function refreshLyricsAdapter() {
         if (!isPiPWindowOpen() || !pipWindow.document.body.classList.contains("lyrics-mode")) return;
 
@@ -3937,60 +4487,92 @@
             }
         }
 
-        if (!page) {
-            lyricsRomanizationAvailable = false;
+        // Stale guard: right after a track change SpicyLyrics keeps the previous song's lines until it re-renders
+        const trackUri = Spicetify.Player.data?.item?.uri || "";
+        if (trackUri !== lyricsTrackUri) {
+            lyricsTrackUri = trackUri;
+            lyricsStaleSig = content ? getLyricsContentSig(content) : "";
+            lyricsStaleUntil = Date.now() + LYRICS_STALE_TIMEOUT_MS;
+        }
+
+        // LRCLIB is the preferred source. SpicyLyrics is used when LRCLIB has nothing for this track, or
+        // when a romanized view is requested and SpicyLyrics has romanization (LRCLIB has none).
+        const spicyHasRomanization = !!content?.querySelector(".RomanizedRow");
+        const lrc = getLrclibForCurrentTrack();
+        lyricsLrclibLoading = lrc.state === "loading";
+        if (lrc.state === "ready" && !(lyricsTextMode !== "original" && spicyHasRomanization)) {
+            lyricsRomanizationAvailable = spicyHasRomanization; // keeps the text-mode button usable
             syncLyricsTextModeButton();
-            renderLyricsSnapshot(
-                window.SpicyLyrics ? "Open SpicyLyrics to display its lyrics" : "SpicyLyrics is not detected"
+            renderLrclibLine(lrc);
+            return;
+        }
+
+        if (!page) {
+            renderLyricsFallback(
+                window.SpicyLyrics ? "No lyrics found. Open SpicyLyrics to try." : "No lyrics found"
             );
             return;
         }
         if (!content) {
-            lyricsRomanizationAvailable = false;
-            syncLyricsTextModeButton();
-            renderLyricsSnapshot("Waiting for SpicyLyrics lyrics…");
+            renderLyricsFallback("Waiting for SpicyLyrics lyrics…");
             return;
         }
 
-        const lines = Array.from(content.querySelectorAll(".line"))
-            .map(element => ({
-                element,
-                original: getSpicyLyricsLineText(element),
-                romanized: getSpicyLyricsRomanizedText(element)
-            }))
-            .filter(line => line.original || line.romanized);
-        lyricsRomanizationAvailable = lines.some(line => line.romanized);
+        if (lyricsStaleUntil) {
+            const sig = getLyricsContentSig(content);
+            if (sig !== lyricsStaleSig || Date.now() >= lyricsStaleUntil) {
+                lyricsStaleUntil = 0; // new lyrics arrived (or we waited long enough): trust the view again
+            } else {
+                renderLyricsFallback("Loading lyrics…");
+                return;
+            }
+        }
+
+        setLyricsSourceLabel("SpicyLyrics");
+        // Only the active line is parsed (and cached); the rest of the song is never touched
+        lyricsRomanizationAvailable = spicyHasRomanization; // already measured above
         syncLyricsTextModeButton();
-        if (!lines.length) {
-            renderLyricsSnapshot("No lyric lines are available yet");
-            return;
-        }
 
-        const activeLines = lines.filter(line => line.element.classList.contains("Active"));
-        const active = activeLines.length
-            ? activeLines[activeLines.length - 1]
-            : findVisibleSpicyLyricsLine(lines, content, page);
+        // Look for the active line first: that's one small query. The full line list (hundreds of nodes on a
+        // long song) is only needed when nothing is active, e.g. before the first line.
+        const activeEls = content.querySelectorAll(".line.Active");
+        let active = null;
+        let isActiveLine = false;
+        if (activeEls.length) {
+            active = getLyricsLineData(activeEls[activeEls.length - 1]);
+            isActiveLine = true;
+        } else {
+            const lineEls = content.querySelectorAll(".line");
+            if (!lineEls.length) {
+                renderLyricsFallback("No lyric lines are available yet");
+                return;
+            }
+            const visible = findVisibleSpicyLyricsLine(Array.from(lineEls, element => ({ element })), content, page);
+            active = visible ? getLyricsLineData(visible.element) : null;
+        }
         if (!active) {
             renderLyricsSnapshot("...");
             return;
         }
+        // An active line with no words is an instrumental gap
+        const gap = isActiveLine ? "\u266a" : "...";
         if (lyricsTextMode === "romanized") {
-            renderLyricsSnapshot(
-                "",
-                active.romanized || active.original || "..."
-            );
+            renderLyricsSnapshot("", active.romanized || active.original || gap);
         } else if (lyricsTextMode === "both") {
-            renderLyricsSnapshot("", active.original || "...", active.romanized || "");
+            renderLyricsSnapshot("", active.original || gap, active.romanized || "");
         } else {
-            renderLyricsSnapshot("", active.original || "...");
+            renderLyricsSnapshot("", active.original || gap);
         }
     }
 
     function startLyricsAdapter() {
         stopLyricsAdapter();
-        renderLyricsSnapshot("Looking for SpicyLyrics…");
+        renderLyricsSnapshot("Looking for lyrics…");
+        lyricsTrackUri = Spicetify.Player.data?.item?.uri || ""; // the lyrics already on screen belong to this track
         refreshLyricsAdapter();
-        lyricsPollTimerId = window.setInterval(refreshLyricsAdapter, LYRICS_POLL_INTERVAL_MS);
+        lyricsPollTimerId = window.setInterval(() => {
+            if (isPiPWindowOpen() && !pipWindow.document.hidden) refreshLyricsAdapter();
+        }, LYRICS_POLL_INTERVAL_MS);
     }
 
     function updatePlayPauseButton() {
@@ -4050,7 +4632,7 @@
             s.value = String(pct);
             updateSliderFill(s, pct);
         });
-        const icon = pct === 0 ? ICONS.volumeMute : ICONS.volumeHigh;
+        const icon = pct === 0 ? ICONS.volumeMute : pct <= 60 ? ICONS.volumeMedium : ICONS.volumeHigh;
         ["btn-volume-icon", "btn-volume-icon-compact", "btn-volume-compact"].forEach(id => {
             const b = doc.getElementById(id);
             if (b) b.innerHTML = icon;
@@ -4117,7 +4699,6 @@
                 updateProgressVisuals();
             }
 
-            if (!playerState.isPlaying) return;
             const delay = isUserSeeking ? gap : Math.max(0, gap - (now - lastProgressPaint));
             progressTimerId = resources.setTimeout(() => {
                 progressTimerId = null;
@@ -4298,8 +4879,7 @@
             console.warn("[MiniPlayer] Playbar injection error:", e);
         }
 
-        // 2b. Take over Spotify's own mini player button: intercept its click (capture phase, so Spotify's
-        // handler never runs) and open our player instead. Does nothing when the setting is off.
+        // 2b. Take over Spotify's and SpicyLyrics' "Open in Miniplayer" buttons before their handlers run.
         try {
             const takeoverStyle = document.createElement("style");
             takeoverStyle.id = "miniplayer-takeover-style";
@@ -4310,7 +4890,7 @@
                 if (!settings.replaceNative) return;
                 const t = /** @type {any} */ (e.target);
                 const el = t && t.closest ? t.closest("button, [role='button']") : null;
-                if (!el || !isNativeMiniplayerButton(el)) return;
+                if (!el || (!isNativeMiniplayerButton(el) && !isOpenMiniplayerButton(el))) return;
                 e.preventDefault();
                 e.stopPropagation();
                 e.stopImmediatePropagation();
