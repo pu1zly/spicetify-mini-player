@@ -1,44 +1,72 @@
 # Spicetify Mini Player
 
-An always-on-top, draggable replacement for Spotify's native mini player, built with Chromium's Document Picture-in-Picture capability. It remains visible and fully responsive even while Spotify is minimized. In the Mini Player settings, toggle **Replace Spotify's mini player** to choose whether Spotify's and SpicyLyrics' **Open in Miniplayer** buttons—including episode video controls—open this extension or Spotify's original player.
+An always-on-top, draggable mini player for Spotify, built with Chromium's Document Picture-in-Picture. It stays visible while Spotify is minimized.
+
+In Settings, **Replace Spotify's mini player** controls whether Spotify's and SpicyLyrics' **Open in Miniplayer** buttons—including episode video controls—open this extension or Spotify's original player.
 
 ---
 
 ## Capabilities
 
-- **Always Visible**: Floats above all other windows using native Document PiP.
-- **Three Layout Modes**:
-  - **Standard Mode (360x185)**: Full view featuring album artwork, ambient background glow, live seek bar with timestamps, track/artist details, heart button, playback controls, and volume controls.
-    
-    <p align="center">
-      <img src="assets/standard-mode.png" alt="Standard Mode" />
-    </p>
+### Player layouts
 
-  - **Compact Mode (440x82)**: Streamlined bar with album thumb, title and artist, timeline bar, and playback controls.
-    
-    <p align="center">
-      <img src="assets/compact-mode.png" alt="Compact Mode" />
-    </p>
+- **Standard** (360×185): Artwork, ambient background, timeline, track details, and playback controls.
+- **Compact** (440×82): Artwork, track details, timeline, and compact controls.
+- **Mini** (360×48): A single-line player with scrolling track details.
+- Switch between enabled modes by clicking the artwork or mode button. Drag the player by its header or empty card areas.
+- **Dynamic resizing** is optional. It adapts the layout as the window changes size and provides a button to shrink back to the largest fixed mode.
 
-  - **Mini Mode (360x48)**: Ultra-minimal single-line view combining track title and artist with marquee scrolling and controls.
-    
-    <p align="center">
-      <img src="assets/mini-mode.png" alt="Mini Mode" />
-    </p>
-- **Lyrics Integration**: Mirrors the active lyric from SpicyLyrics or synced LRCLIB data, replacing stale lines as playback advances. Unsynced SpicyLyrics lines fall back to the line nearest the center of the lyrics view. A small header label shows whether lyrics came from **LRCLIB** or **SpicyLyrics**.
-- **Lyric Text Modes**: In Standard Mode, cycle between **Original**, **Romanized**, and **Both** when SpicyLyrics provides romanization. The mode selector is hidden for English-only or otherwise non-romanized lyrics. Both available modes are shown with the romanization underneath, including narrower and shorter resizable layouts when the view has enough height. For variant switching, set SpicyLyrics to **Under each line**.
-- **Podcast Video Preview (Experimental)**: Shows accessible Spotify episode video in an enlarged landscape frame once the window reaches at least 690×420 px. Below that size, Compact and Mini layouts keep the same square cover-art sizing used for music and episodes, including 52 px, 42 px, and 24 px fluid variants. Click the episode thumbnail in a shrunk dynamic layout to expand directly to 690×420 px and activate video playback. Music artwork remains square. If capture is unavailable or protected media blocks it, the episode artwork remains visible.
-- **Lyrics That Scale with the Window**: With Dynamic Resizing enabled, lyric text grows with larger window sizes, independently of the rest of the interface, up to 2.5x its base scale.
-- **Compact Controls**: Uses dedicated mic-vocal and Lucide-style volume icons. The volume button switches between mute, low volume at 60% or below, and high volume above 60%.
-- **Dynamic Resizing**: An experimental setting that lets the window resize freely, switches between Mini, Compact, and Standard layouts, scales the interface, and shows a larger album-art layout when tall. A top-bar button can shrink the window back to the largest fixed mode.
-- **Fluid Video Layout**: Expanded podcast-video layouts reserve space for the landscape preview and position the timeline beneath it, while music and non-video podcasts use the raised timeline position.
-- **Next Up Display**: Shows upcoming queue items in a top bar by reading the queue directly.
-- **Smooth Playback**: Powered by `requestAnimationFrame` for timeline updates without unneeded DOM manipulation.
-- **Native Dragging**: Move the player anywhere on screen using header or empty card areas.
-- **Fast Access**:
-  - Shortcut: `Alt + M` (disabled while typing in inputs)
-  - Playbar button next to Spotify queue and lyrics
-  - Topbar settings button
+<details>
+  <summary>Preview the layouts</summary>
+
+  **Standard**
+
+  <p align="center">
+    <img src="assets/standard-mode.png" alt="Standard Mode" />
+  </p>
+
+  **Compact**
+
+  <p align="center">
+    <img src="assets/compact-mode.png" alt="Compact Mode" />
+  </p>
+
+  **Mini**
+
+  <p align="center">
+    <img src="assets/mini-mode.png" alt="Mini Mode" />
+  </p>
+</details>
+
+### Playback and lyrics
+
+- Timeline, timestamps, playback controls, and volume controls.
+- Lyrics from SpicyLyrics or synced LRCLIB data, with a source label and updates as playback advances.
+- In Standard mode, choose **Original**, **Romanized**, or **Both** when romanized lyrics are available. English-only lyrics do not show the selector.
+- Dynamic resizing scales lyric text up to 2.5×.
+- Volume control uses separate mute, low-volume, and high-volume icons.
+
+### Podcasts and video
+
+- Experimental episode-video preview expands to a landscape frame at 690×420 or larger.
+- In a shrunk dynamic layout, click the episode thumbnail to expand the player and start video playback.
+- If video capture is unavailable or blocked, episode artwork remains visible.
+
+### Queue
+
+- Pins the current track above the upcoming list with a playback indicator.
+- Shows the queue snapshot exposed by Spotify. At 100 items, the count becomes a lower bound and the panel warns that more items may exist. Spotify's documented API has no pagination.
+- Rows render in batches. Actions check item type and queue identity before playing, reordering, adding, or removing.
+- **Play now** moves a manually queued item to the front, then advances playback to preserve the active playlist context.
+- Select and remove multiple manually queued items; bulk removal confirms multi-item changes and reports partial failures.
+- Drag manually queued items to reorder them. Context tracks cannot be reordered or bulk-selected.
+- Album/show/artist navigation and link copying appear only when Spotify provides a valid destination.
+
+### Shortcuts and access
+
+- Configure the mini player toggle shortcut in **Settings → Controls** (default: `Alt + M`).
+- The shortcut is ignored while typing in editable fields.
+- Open the player from the playbar button or open settings from the topbar button.
 
 ---
 
@@ -65,7 +93,7 @@ An always-on-top, draggable replacement for Spotify's native mini player, built 
    spicetify apply
    ```
 
-3. Toggle the player anytime in Spotify with `Alt + M` or by clicking the mini player icon in the playbar.
+3. Open the player with the configured shortcut (default: `Alt + M`) or click its playbar icon.
 
 ---
 
