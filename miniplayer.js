@@ -39,7 +39,16 @@
     let lastQueueKey = null;
     let queueMenuEl = null;
     let queueMenuDisposers = [];
+    let queueSelectionMode = false;
+    let queueSelectedItems = new Map();
+    let queueBulkConfirm = false;
+    let queueBulkRemoving = false;
     let queueRenderDisposers = [];
+    let queueRowDisposers = new Map();
+    let renderedQueueItems = null;
+    let queueHeadRemoval = null;
+    let queueDragDisposers = [];
+    let queueDragState = null;
     let queueRenderGeneration = 0;
     // Re-evaluates which mini player launcher the playback bar shows (assigned in registerButtons)
     let syncPlaybarButtons = () => {};
@@ -57,6 +66,7 @@
     const playerStateListeners = new Set();
     const PLAYER_STATE_SYNC_MS = 2500;
     const QUEUE_STATE_SYNC_MS = 1500;
+    const QUEUE_SNAPSHOT_WARNING_THRESHOLD = 100;
     const WINDOW_POSITION_SYNC_MS = 2500;
     const EPISODE_VIDEO_SYNC_MS = 500;
     const LYRICS_TEXT_MODES = ["original", "romanized", "both"];
@@ -353,6 +363,7 @@
     function cleanupPiPResources() {
         stopLyricsAdapter();
         releaseEpisodeVideo();
+        clearQueueDrag(true);
         const resources = pipResources;
         pipResources = null;
         resources?.cleanup();
@@ -365,7 +376,17 @@
         lastQueueKey = null;
         queueMenuEl = null;
         queueMenuDisposers = [];
+        queueSelectionMode = false;
+        queueSelectedItems.clear();
+        queueBulkConfirm = false;
+        queueBulkRemoving = false;
         queueRenderDisposers = [];
+        queueRowDisposers.clear();
+        renderedQueueItems = null;
+        queueHeadRemoval?.animation.cancel();
+        queueHeadRemoval = null;
+        queueDragDisposers = [];
+        queueDragState = null;
         queueRenderGeneration++;
         lastFormattedTime = "";
         lastSliderValue = -1;
@@ -401,6 +422,7 @@
         scrollAdjust: true,      // wheel = volume, wheel over timeline = seek
         seekStep: 5,             // seconds per scroll notch
         volumeStep: 5,           // percent per scroll notch
+        toggleShortcut: { code: "KeyM", key: "M", altKey: true, ctrlKey: false, shiftKey: false, metaKey: false },
         clickToOpen: true,       // click title/artist to open album/artist page
         dynamicResize: false,    // experimental: free window resizing, the layout adapts to the size
         showUpcoming: true,      // Show the next playback-queue item in the top bar
@@ -413,9 +435,52 @@
         return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
     };
 
+    function normalizeToggleShortcut(shortcut) {
+        const fallback = DEFAULT_SETTINGS.toggleShortcut;
+        if (!shortcut || typeof shortcut !== "object") return { ...fallback };
+        const code = typeof shortcut.code === "string" ? shortcut.code.trim() : "";
+        const key = typeof shortcut.key === "string" ? shortcut.key : "";
+        const hasModifier = !!(shortcut.ctrlKey || shortcut.altKey || shortcut.shiftKey || shortcut.metaKey);
+        if (!code || !key || ["Control", "Alt", "Shift", "Meta"].includes(key) || !hasModifier) {
+            return { ...fallback };
+        }
+        return {
+            code,
+            key,
+            ctrlKey: !!shortcut.ctrlKey,
+            altKey: !!shortcut.altKey,
+            shiftKey: !!shortcut.shiftKey,
+            metaKey: !!shortcut.metaKey
+        };
+    }
+
+    function formatToggleShortcut(shortcut = settings.toggleShortcut) {
+        const parts = [];
+        if (shortcut.ctrlKey) parts.push("Ctrl");
+        if (shortcut.altKey) parts.push("Alt");
+        if (shortcut.shiftKey) parts.push("Shift");
+        if (shortcut.metaKey) parts.push("Meta");
+        const key = shortcut.key === " "
+            ? "Space"
+            : shortcut.key.length === 1
+                ? shortcut.key.toUpperCase()
+                : shortcut.key.replace(/^Arrow/, "Arrow ");
+        parts.push(key);
+        return parts.join(" + ");
+    }
+
+    function shortcutMatchesEvent(event, shortcut = settings.toggleShortcut) {
+        return (event.code || event.key) === shortcut.code
+            && event.ctrlKey === shortcut.ctrlKey
+            && event.altKey === shortcut.altKey
+            && event.shiftKey === shortcut.shiftKey
+            && event.metaKey === shortcut.metaKey;
+    }
+
     function cloneDefaultSettings() {
         return {
             ...DEFAULT_SETTINGS,
+            toggleShortcut: { ...DEFAULT_SETTINGS.toggleShortcut },
             modes: { ...DEFAULT_SETTINGS.modes }
         };
     }
@@ -433,6 +498,7 @@
         s.idleDelay = clampNum(s.idleDelay, 200, 5000, DEFAULT_SETTINGS.idleDelay);
         s.seekStep = clampNum(s.seekStep, 1, 30, DEFAULT_SETTINGS.seekStep);
         s.volumeStep = clampNum(s.volumeStep, 1, 20, DEFAULT_SETTINGS.volumeStep);
+        s.toggleShortcut = normalizeToggleShortcut(s.toggleShortcut);
         ["autoFade", "rememberPosition", "scrollAdjust", "clickToOpen", "showUpcoming", "replaceNative", "dynamicResize"].forEach(k => { s[k] = !!s[k]; });
         const savedModes = (saved && typeof saved.modes === "object" && saved.modes) || {};
         s.modes = {
@@ -554,6 +620,7 @@
     // Pushes current settings into an open mini player window
     function applySettings() {
         syncPlaybarButtons(); // "Replace Spotify's mini player" applies even when our window is closed
+        updatePlaybarShortcutLabel();
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
         doc.documentElement.style.setProperty("--idle-opacity", String(settings.idleOpacity));
@@ -566,6 +633,15 @@
         refreshModeUi();
         lastUpcomingKey = null; // lets the "Show next song" setting apply instantly
         updateUpcomingBar();
+    }
+
+    function updatePlaybarShortcutLabel() {
+        const button = document.getElementById("miniplayer-playbar-btn");
+        if (!button) return;
+        const label = `Mini Player (${formatToggleShortcut()})`;
+        button.setAttribute("aria-label", label);
+        button.title = label;
+        if (typeof button._tippy?.setContent === "function") button._tippy.setContent(label);
     }
 
     // Updates the cover's hover icon, the Mini-mode button and their tooltips for the next mode
@@ -698,6 +774,8 @@
             .mp-range input:active::-webkit-slider-thumb { opacity: 1; }
             .mp-value { min-width: 38px; text-align: right; font-size: 12px; color: #a7a7a7; font-variant-numeric: tabular-nums; }
             .mp-inline { display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
+            .mp-shortcut-control { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+            .mp-shortcut-status { max-width: 180px; color: #a7a7a7; font-size: 10px; line-height: 1.3; text-align: right; }
             /* Pill buttons, Spotify style: outlined secondary, solid white primary */
             .mp-btn { font: inherit; font-size: 13px; font-weight: 700; padding: 9px 22px; border-radius: 999px; border: 1px solid #727272; background: transparent; color: #fff; cursor: pointer; transition: border-color 0.15s ease, transform 0.1s ease; }
             .mp-btn:hover { border-color: #fff; transform: scale(1.04); }
@@ -774,6 +852,66 @@
             return wrap;
         };
 
+        const shortcutControl = () => {
+            const wrap = h("div", "mp-shortcut-control");
+            const button = h("button", "mp-btn small", formatToggleShortcut());
+            const status = h("span", "mp-shortcut-status", "");
+            let recording = false;
+            button.type = "button";
+            button.setAttribute("aria-label", `Change mini player shortcut, currently ${formatToggleShortcut()}`);
+            status.setAttribute("aria-live", "polite");
+
+            const stopRecording = (message) => {
+                recording = false;
+                button.textContent = formatToggleShortcut();
+                button.setAttribute("aria-label", `Change mini player shortcut, currently ${formatToggleShortcut()}`);
+                status.textContent = message;
+            };
+            button.addEventListener("click", () => {
+                recording = true;
+                button.textContent = "Press keys…";
+                button.setAttribute("aria-label", "Press a key combination; Escape cancels");
+                status.textContent = "Include a modifier key. Escape cancels.";
+            });
+            button.addEventListener("keydown", event => {
+                if (!recording) return;
+                event.preventDefault();
+                event.stopPropagation();
+                if (event.key === "Escape") {
+                    stopRecording("Shortcut change canceled.");
+                    return;
+                }
+                if (["Control", "Alt", "Shift", "Meta"].includes(event.key)) {
+                    status.textContent = "Now press a non-modifier key.";
+                    return;
+                }
+                if (!(event.ctrlKey || event.altKey || event.shiftKey || event.metaKey)) {
+                    status.textContent = "Include Ctrl, Alt, Shift, or Meta.";
+                    return;
+                }
+                const code = event.code && event.code !== "Unidentified" ? event.code : event.key;
+                if (!code || code === "Unidentified") {
+                    status.textContent = "That key could not be recognized. Try another.";
+                    return;
+                }
+
+                settings.toggleShortcut = normalizeToggleShortcut({
+                    code,
+                    key: event.key,
+                    ctrlKey: event.ctrlKey,
+                    altKey: event.altKey,
+                    shiftKey: event.shiftKey,
+                    metaKey: event.metaKey
+                });
+                saveSettings();
+                updatePlaybarShortcutLabel();
+                stopRecording(`Shortcut set to ${formatToggleShortcut()}.`);
+            });
+            wrap.appendChild(button);
+            wrap.appendChild(status);
+            return wrap;
+        };
+
         // Chips for choosing which modes are available (at least one must stay on)
         const modeChips = () => {
             const wrap = h("div", "mp-chips");
@@ -825,6 +963,8 @@
         row("Remember window position", "Reopen the mini player where you left it.", posControls);
 
         section("Controls");
+        row("Mini player shortcut", "Click the button, then press a key combination with a modifier. Escape cancels.",
+            shortcutControl());
         row("Scroll to adjust", "Scroll over the timeline to seek, anywhere else to change volume.", toggle("scrollAdjust"));
         row("Seek step", "Seconds per scroll notch over the timeline.",
             slider("seekStep", 1, 30, 1, v => v, v => v, v => `${v}s`));
@@ -1260,6 +1400,183 @@
         return pipResources ? pipResources.delay(ms) : Promise.resolve(false);
     }
 
+    function queueEntryParts(entry) {
+        const track = entry?.contextTrack || entry || {};
+        return {
+            uid: String(track.uid || ""),
+            uri: String(track.uri || ""),
+            source: String(entry?.contextTrack ? entry.provider || "" : entry?.fromQueue ? "queue" : "context"),
+            removed: !!(entry?.removed && entry.removed.length)
+        };
+    }
+
+    function parseSpotifyResource(uri) {
+        const match = /^spotify:(track|episode|album|artist|playlist|show):([A-Za-z0-9]+)$/.exec(String(uri || ""));
+        return match ? { type: match[1], id: match[2] } : null;
+    }
+
+    function shareableSpotifyLink(uri) {
+        const resource = parseSpotifyResource(uri);
+        return resource && (resource.type === "track" || resource.type === "episode")
+            ? `https://open.spotify.com/${resource.type}/${resource.id}`
+            : "";
+    }
+
+    function queueStructureSignature(entries) {
+        return JSON.stringify(entries.map(entry => {
+            const { uid, uri, source, removed } = queueEntryParts(entry);
+            return [uid, uri, source, removed];
+        }));
+    }
+
+    function queueActiveStructureSignature(entries, excludedIndex = -1) {
+        return JSON.stringify(entries.reduce((active, entry, index) => {
+            if (index === excludedIndex) return active;
+            const parts = queueEntryParts(entry);
+            if (!parts.removed) active.push([parts.uid, parts.uri, parts.source]);
+            return active;
+        }, []));
+    }
+
+    function queueOccurrenceIdentity(entry, index, entries, uidCounts) {
+        const parts = queueEntryParts(entry);
+        const uidOccurrences = parts.uid ? (uidCounts?.get(parts.uid) ?? 1) : 0;
+        if (parts.uid && uidOccurrences === 1) return `uid:${parts.uid}`;
+
+        const neighbor = candidate => {
+            if (!candidate) return "";
+            const p = queueEntryParts(candidate);
+            return p.uid ? `uid:${p.uid}` : `${p.source}:${p.uri}`;
+        };
+        return JSON.stringify([
+            "position",
+            index,
+            parts.uri,
+            parts.source,
+            neighbor(entries[index - 1]),
+            neighbor(entries[index + 1])
+        ]);
+    }
+
+    function resolveQueueOccurrence(item, entries, revision, { removal = false } = {}) {
+        if (!Array.isArray(entries)) return { status: "unsupported", reason: "Queue snapshot is unavailable" };
+        if (!item?.uri) return { status: "not-found", reason: "Queue item has no URI" };
+
+        if (item.uid) {
+            const matches = [];
+            entries.forEach((entry, index) => {
+                if (queueEntryParts(entry).uid === String(item.uid)) matches.push({ entry, index });
+            });
+            if (!matches.length) return { status: "not-found", reason: "Queue item is no longer present" };
+            if (matches.length !== 1) return { status: "ambiguous", reason: "Spotify returned a duplicate queue UID" };
+            const match = matches[0];
+            if (queueEntryParts(match.entry).removed) {
+                return { status: "not-found", reason: "Queue item has already been removed" };
+            }
+            if (queueEntryParts(match.entry).uri !== item.uri) {
+                return { status: "conflict", reason: "Queue UID now points to a different item" };
+            }
+            if (item.fromQueue !== (queueEntryParts(match.entry).source === "queue")) {
+                return { status: "not-found", reason: "Queue item source changed" };
+            }
+            return { status: "success", ...match };
+        }
+
+        const currentSignature = queueStructureSignature(entries);
+        if (!item.queueSnapshotSignature || currentSignature !== item.queueSnapshotSignature) {
+            return { status: "conflict", reason: "Queue changed since this item was displayed" };
+        }
+        if (item.queueRevision != null && revision != null && item.queueRevision !== revision) {
+            return { status: "conflict", reason: "Queue revision changed since this item was displayed" };
+        }
+
+        const index = item.queueIndex;
+        const entry = Number.isInteger(index) ? entries[index] : null;
+        if (!entry || queueOccurrenceIdentity(entry, index, entries) !== item.identity) {
+            return { status: "not-found", reason: "Queue occurrence could not be matched" };
+        }
+        const parts = queueEntryParts(entry);
+        if (parts.removed) return { status: "not-found", reason: "Queue item has already been removed" };
+        if (parts.uri !== item.uri || item.fromQueue !== (parts.source === "queue")) {
+            return { status: "not-found", reason: "Queue item source or URI changed" };
+        }
+        if (removal && entries.filter(candidate => queueEntryParts(candidate).uri === item.uri).length > 1) {
+            return { status: "ambiguous", reason: "Spotify's removal API cannot distinguish duplicate URIs without a queue UID" };
+        }
+        return { status: "success", entry, index };
+    }
+
+    async function applyQueueReorder(item, destination) {
+        const eligibilityReason = SpotifyAdapter.canMoveToNext(item);
+        if (eligibilityReason) return { status: "unsupported", reason: eligibilityReason };
+
+        const queue = Spicetify.Platform?.PlayerAPI?._queue;
+        const client = queue?._client;
+        const state = queue?._queue;
+        const entries = state?.nextTracks;
+        const revision = state?.queueRevision;
+        if (!Array.isArray(entries)) return { status: "unsupported", reason: "Spotify's internal queue snapshot is unavailable" };
+        if (revision == null) return { status: "unsupported", reason: "Spotify's queue revision is unavailable; reordering cannot be guarded safely" };
+
+        const source = resolveQueueOccurrence(item, entries, revision);
+        if (source.status !== "success") return source;
+        if (queueEntryParts(source.entry).source !== "queue") {
+            return { status: "unsupported", reason: "Only manually queued items can be reordered" };
+        }
+
+        let destinationIndex = destination.index;
+        if (destination.item) {
+            const target = resolveQueueOccurrence(destination.item, entries, revision);
+            if (target.status !== "success") return target;
+            if (target.index === source.index) return { status: "already-positioned" };
+            const placementOffset = destination.placement === "after" ? 1 : 0;
+            destinationIndex = target.index - (source.index < target.index ? 1 : 0) + placementOffset;
+        }
+        if (!Number.isInteger(destinationIndex)) {
+            return { status: "unsupported", reason: "The requested queue position is invalid" };
+        }
+
+        const nextTracks = [...entries];
+        const [track] = nextTracks.splice(source.index, 1);
+        destinationIndex = Math.max(0, Math.min(destinationIndex, nextTracks.length));
+        if (destinationIndex === source.index) {
+            return { status: destination.index === 0 ? "already-next" : "already-positioned" };
+        }
+        nextTracks.splice(destinationIndex, 0, track);
+
+        const beforeSignature = queueStructureSignature(entries);
+        const latest = queue?._queue;
+        if (!Array.isArray(latest?.nextTracks)) {
+            return { status: "unsupported", reason: "Spotify's internal queue snapshot disappeared" };
+        }
+        if (latest.queueRevision !== revision || queueStructureSignature(latest.nextTracks) !== beforeSignature) {
+            return { status: "conflict", reason: "Queue changed before the reorder could be applied" };
+        }
+        try {
+            const result = await client.setQueue({
+                nextTracks,
+                prevTracks: latest.prevTracks,
+                queueRevision: revision
+            });
+            if (result === false) return { status: "failed", reason: "Spotify rejected the reorder request" };
+        } catch (error) {
+            console.warn("[MiniPlayer] Queue setQueue API failed:", error?.message || "unknown error");
+            return { status: "conflict", reason: "Spotify rejected the queue revision or reorder request" };
+        }
+
+        const expectedSignature = queueStructureSignature(nextTracks);
+        let verified = false;
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const current = queue?._queue?.nextTracks;
+            if (Array.isArray(current) && queueStructureSignature(current) === expectedSignature) {
+                verified = true;
+                break;
+            }
+            if (attempt < 3) await sleep(100);
+        }
+        return { status: "success", verified };
+    }
+
     const SpotifyAdapter = {
         async play(uri, options = {}) {
             const api = Spicetify.Platform?.PlayerAPI;
@@ -1272,54 +1589,357 @@
             throw new Error("No play API available");
         },
 
-        async removeFromQueue(item) {
-            const payload = [{ uri: item.uri, uid: item.uid }];
-            const api = Spicetify.Platform?.PlayerAPI;
-            if (typeof api?.removeFromQueue === "function") {
-                return api.removeFromQueue(payload);
+        canPlay(item) {
+            const uri = String(item?.uri || "");
+            const resource = parseSpotifyResource(uri);
+            const isLocalTrack = uri.startsWith("spotify:local:") && uri.length > "spotify:local:".length;
+            if (!resource || (resource.type !== "track" && resource.type !== "episode")) {
+                if (!isLocalTrack) return "This item type can't be played from the queue menu";
             }
-            if (typeof Spicetify.removeFromQueue === "function") {
-                return Spicetify.removeFromQueue(payload);
-            }
-            throw new Error("Remove from queue isn't available");
+            return typeof Spicetify.Platform?.PlayerAPI?.play === "function"
+                || typeof Spicetify.Player?.playUri === "function"
+                ? ""
+                : "Spotify's playback API is unavailable";
         },
 
-        async moveToNext(item) {
+        canPlayNow(item) {
+            if (!item?.fromQueue) return this.canPlay(item);
+            const reorderReason = this.canMoveToNext(item);
+            if (reorderReason) return reorderReason;
+            return typeof Spicetify.Player?.next === "function"
+                ? ""
+                : "Spotify's Next playback action is unavailable";
+        },
+
+        canMoveToNext(item) {
+            if (!item?.fromQueue) return "Only manually queued items can be reordered";
+            if (item.uid && item.uidOccurrenceCount > 1) return "Spotify returned a duplicate queue UID for this item";
+            if (!item.uid && (!item.identity || !item.queueSnapshotSignature || !Number.isInteger(item.queueIndex))) {
+                return "This queue item has no safe occurrence identity";
+            }
             const queue = Spicetify.Platform?.PlayerAPI?._queue;
-            const state = queue?._queue;
-            const client = queue?._client;
-            if (!Array.isArray(state?.nextTracks) || typeof client?.setQueue !== "function") {
-                throw new Error("Queue reordering isn't available");
+            if (typeof queue?._client?.setQueue !== "function") return "Spotify's queue reorder API is unavailable";
+            if (!Array.isArray(queue?._queue?.nextTracks)) return "Spotify's internal queue snapshot is unavailable";
+            return queue._queue.queueRevision != null
+                ? ""
+                : "Spotify's queue revision is unavailable; reordering cannot be guarded safely";
+        },
+
+        canRemoveFromQueue(item) {
+            const supported = typeof Spicetify.Platform?.PlayerAPI?.removeFromQueue === "function"
+                || typeof Spicetify.removeFromQueue === "function"
+            if (!supported) return "Spotify's queue removal API is unavailable";
+            const { entries, revision } = this.getQueueSnapshot();
+            const target = resolveQueueOccurrence(item, entries, revision, { removal: true });
+            return target.status === "success" ? "" : target.reason;
+        },
+
+        canBulkRemoveFromQueue(item) {
+            if (!item?.fromQueue) return "Bulk removal is limited to manually queued items";
+            return this.canRemoveFromQueue(item);
+        },
+
+        canAddToQueue(item) {
+            if (item?.fromQueue) return "This item is already in the queue";
+            const resource = parseSpotifyResource(item?.uri);
+            if (!resource || (resource.type !== "track" && resource.type !== "episode")) {
+                return "Only tracks and episodes can be added to the queue";
+            }
+            return typeof Spicetify.addToQueue === "function"
+                && typeof Spicetify.Player?.origin?._queue?.addToQueue === "function"
+                ? ""
+                : "Spotify's queue add API is unavailable";
+        },
+
+        canOpenSpotifyPage(uri, expectedTypes) {
+            const resource = parseSpotifyResource(uri);
+            if (!resource || !expectedTypes.includes(resource.type)) return "No valid Spotify page is available";
+            return typeof Spicetify.Platform?.History?.push === "function"
+                ? ""
+                : "Spotify page navigation is unavailable";
+        },
+
+        getQueueSnapshot() {
+            const state = Spicetify.Platform?.PlayerAPI?._queue?._queue;
+            const entries = Array.isArray(state?.nextTracks) ? state.nextTracks : Spicetify.Queue?.nextTracks;
+            return { entries, revision: state?.queueRevision ?? Spicetify.Queue?.queueRevision };
+        },
+
+        resolveQueueItem(item) {
+            const { entries, revision } = this.getQueueSnapshot();
+            return resolveQueueOccurrence(item, entries, revision);
+        },
+
+        async addToQueue(item) {
+            const reason = this.canAddToQueue(item);
+            if (reason) return { status: "unsupported", reason };
+            const add = Spicetify.addToQueue;
+            const target = this.resolveQueueItem(item);
+            if (target.status !== "success") return target;
+            try {
+                const uri = queueEntryParts(target.entry).uri;
+                const countManualMatches = entries => {
+                    if (!Array.isArray(entries)) return null;
+                    return entries.filter(entry => {
+                        const parts = queueEntryParts(entry);
+                        return !parts.removed && parts.source === "queue" && parts.uri === uri;
+                    }).length;
+                };
+                const manualCounts = () => ({
+                    internal: countManualMatches(Spicetify.Platform?.PlayerAPI?._queue?._queue?.nextTracks),
+                    public: countManualMatches(Spicetify.Queue?.nextTracks)
+                });
+                const hasNewManualMatch = (before, current) => ["internal", "public"].some(source =>
+                    before[source] != null && current[source] != null && current[source] > before[source]
+                );
+                const previousCounts = manualCounts();
+                // Spicetify's queue helper forwards URI objects to Spotify's queue method.
+                const result = await add([{ uri }]);
+                if (result === false) {
+                    for (let attempt = 0; attempt < 10; attempt++) {
+                        if (hasNewManualMatch(previousCounts, manualCounts())) {
+                            return { status: "success", verified: true };
+                        }
+                        if (attempt < 9) await sleep(100);
+                    }
+                    console.warn("[MiniPlayer] Queue add returned false and no new manual queue item appeared.", {
+                        uriType: uri.split(":")[1] || "unknown",
+                        before: previousCounts,
+                        after: manualCounts()
+                    });
+                    return { status: "failed", reason: "Spotify rejected the queue add request" };
+                }
+                return { status: "success" };
+            } catch (error) {
+                const response = error?.response || error?.cause?.response;
+                console.warn("[MiniPlayer] Queue add API threw:", {
+                    name: error?.name || "",
+                    message: error?.message || response?.data?.message || response?.body?.message || "unknown error",
+                    stack: typeof error?.stack === "string" ? error.stack.split("\n").slice(0, 6).join("\n") : "",
+                    status: error?.status ?? error?.statusCode ?? response?.status ?? null,
+                    statusText: error?.statusText || response?.statusText || "",
+                    responseMessage: response?.data?.message || response?.body?.message || ""
+                });
+                return { status: "failed", reason: "Spotify's queue add request failed" };
+            }
+        },
+
+        async removeFromQueue(item) {
+            const api = Spicetify.Platform?.PlayerAPI;
+            const remove = typeof api?.removeFromQueue === "function"
+                ? api.removeFromQueue.bind(api)
+                : typeof Spicetify.removeFromQueue === "function"
+                    ? Spicetify.removeFromQueue
+                    : null;
+            if (!remove) return { status: "unsupported", reason: "Spotify removeFromQueue API is unavailable" };
+
+            const { entries, revision } = this.getQueueSnapshot();
+            const target = resolveQueueOccurrence(item, entries, revision, { removal: true });
+            if (target.status !== "success") return target;
+            const parts = queueEntryParts(target.entry);
+            try {
+                const result = await remove([{ uri: parts.uri, uid: parts.uid || undefined }]);
+                if (result === false) return { status: "failed", reason: "Spotify rejected the remove request" };
+            } catch (error) {
+                console.warn("[MiniPlayer] Queue remove API failed:", error?.message || "unknown error");
+                return { status: "failed", reason: "Spotify's remove request failed" };
             }
 
-            const nextTracks = [...state.nextTracks];
-            let index = item.uid
-                ? nextTracks.findIndex(track => track?.contextTrack?.uid === item.uid)
-                : -1;
-            if (index < 0) index = nextTracks.findIndex(track => track?.contextTrack?.uri === item.uri);
-            if (index < 0) throw new Error("Track is no longer in the queue");
-            if (index === 0) return false;
+            const beforeUriCount = parts.uid
+                ? 0
+                : entries.filter(entry => {
+                    const candidate = queueEntryParts(entry);
+                    return !candidate.removed && candidate.uri === parts.uri;
+                }).length;
+            const stillQueued = () => {
+                const latest = Spicetify.Platform?.PlayerAPI?._queue?._queue?.nextTracks
+                    || Spicetify.Queue?.nextTracks;
+                if (!Array.isArray(latest)) return null;
+                return parts.uid
+                    ? latest.some(entry => {
+                        const candidate = queueEntryParts(entry);
+                        return !candidate.removed && candidate.uid === parts.uid;
+                    })
+                    : latest.filter(entry => {
+                        const candidate = queueEntryParts(entry);
+                        return !candidate.removed && candidate.uri === parts.uri;
+                    }).length >= beforeUriCount;
+            };
+            for (let attempt = 0; attempt < 4; attempt++) {
+                if (stillQueued() === false) return { status: "success", verified: true };
+                if (attempt < 3) await sleep(100);
+            }
+            return { status: "success", verified: false };
+        },
 
-            const [track] = nextTracks.splice(index, 1);
-            nextTracks.unshift(track);
-            await client.setQueue({
-                nextTracks,
-                prevTracks: state.prevTracks,
-                queueRevision: state.queueRevision
-            });
-            return true;
+        async removeManyFromQueue(items) {
+            if (!Array.isArray(items) || !items.length) {
+                return { status: "failed", succeeded: 0, failed: [{ reason: "No queue items are selected" }] };
+            }
+            const initial = this.getQueueSnapshot();
+            if (!Array.isArray(initial.entries)) {
+                return { status: "unsupported", succeeded: 0, failed: [{ reason: "Queue snapshot is unavailable" }] };
+            }
+
+            const failures = [];
+            const targets = [];
+            const seenTargets = new Set();
+            for (const item of items) {
+                if (!item?.fromQueue) {
+                    failures.push({ item, reason: "Bulk removal is limited to manually queued items" });
+                    continue;
+                }
+                const capabilityReason = this.canRemoveFromQueue(item);
+                if (capabilityReason) {
+                    failures.push({ item, reason: capabilityReason });
+                    continue;
+                }
+                const resolved = resolveQueueOccurrence(item, initial.entries, initial.revision, { removal: true });
+                if (resolved.status !== "success") {
+                    failures.push({ item, reason: resolved.reason });
+                    continue;
+                }
+                const parts = queueEntryParts(resolved.entry);
+                const targetKey = parts.uid ? `uid:${parts.uid}` : `index:${resolved.index}`;
+                if (seenTargets.has(targetKey)) {
+                    failures.push({ item, reason: "The same queue occurrence was selected more than once" });
+                    continue;
+                }
+                seenTargets.add(targetKey);
+                targets.push({ item, uid: parts.uid, uri: parts.uri, index: resolved.index });
+            }
+
+            targets.sort((a, b) => b.index - a.index);
+            let expectedSignature = queueActiveStructureSignature(initial.entries);
+            let succeeded = 0;
+            const succeededItems = [];
+            for (let index = 0; index < targets.length; index++) {
+                const target = targets[index];
+                const current = this.getQueueSnapshot();
+                if (!Array.isArray(current.entries)) {
+                    failures.push({ item: target.item, reason: "Queue snapshot became unavailable" });
+                    for (let pending = index + 1; pending < targets.length; pending++) {
+                        failures.push({ item: targets[pending].item, reason: "Stopped because the queue snapshot is unavailable" });
+                    }
+                    break;
+                }
+                const currentSignature = queueActiveStructureSignature(current.entries);
+                if (currentSignature !== expectedSignature) {
+                    failures.push({ item: target.item, reason: "Queue changed during bulk removal; stopped to avoid removing the wrong item" });
+                    for (let pending = index + 1; pending < targets.length; pending++) {
+                        failures.push({ item: targets[pending].item, reason: "Stopped because the queue changed during bulk removal" });
+                    }
+                    break;
+                }
+
+                const uriMatches = current.entries.filter(entry => queueEntryParts(entry).uri === target.uri);
+                if (!target.uid && uriMatches.length > 1) {
+                    failures.push({ item: target.item, reason: "Duplicate URIs without queue IDs cannot be removed safely" });
+                    continue;
+                }
+                const matches = [];
+                current.entries.forEach((entry, entryIndex) => {
+                    const parts = queueEntryParts(entry);
+                    if (parts.removed || parts.source !== "queue" || parts.uri !== target.uri) return;
+                    if (target.uid && parts.uid !== target.uid) return;
+                    if (!target.uid && parts.uid) return;
+                    matches.push({ entry, index: entryIndex });
+                });
+                if (matches.length !== 1) {
+                    failures.push({
+                        item: target.item,
+                        reason: matches.length ? "Queue item identity is ambiguous" : "Queue item is no longer present"
+                    });
+                    continue;
+                }
+
+                const match = matches[0];
+                const parts = queueEntryParts(match.entry);
+                const currentItem = {
+                    ...target.item,
+                    uid: parts.uid || undefined,
+                    uri: parts.uri,
+                    fromQueue: true,
+                    queueIndex: match.index,
+                    queueRevision: current.revision,
+                    identity: queueOccurrenceIdentity(match.entry, match.index, current.entries),
+                    queueSnapshotSignature: queueStructureSignature(current.entries)
+                };
+                const result = await this.removeFromQueue(currentItem);
+                const after = this.getQueueSnapshot();
+                if (!Array.isArray(after.entries)) {
+                    failures.push({ item: target.item, reason: "Queue could not be verified after removal" });
+                    for (let pending = index + 1; pending < targets.length; pending++) {
+                        failures.push({ item: targets[pending].item, reason: "Stopped because the queue could not be verified" });
+                    }
+                    break;
+                }
+
+                const afterSignature = queueActiveStructureSignature(after.entries);
+                const expectedAfter = queueActiveStructureSignature(current.entries, match.index);
+                if (afterSignature === expectedAfter) {
+                    succeeded++;
+                    succeededItems.push(target.item);
+                    expectedSignature = expectedAfter;
+                    continue;
+                }
+                if (afterSignature === currentSignature) {
+                    failures.push({
+                        item: target.item,
+                        reason: result.status === "success"
+                            ? "Spotify did not remove the selected item"
+                            : result.reason || "Spotify rejected the remove request"
+                    });
+                    continue;
+                }
+                failures.push({ item: target.item, reason: "Queue changed during bulk removal; stopped to avoid removing the wrong item" });
+                for (let pending = index + 1; pending < targets.length; pending++) {
+                    failures.push({ item: targets[pending].item, reason: "Stopped because the queue changed during bulk removal" });
+                }
+                break;
+            }
+
+            return {
+                status: failures.length ? (succeeded ? "partial" : "failed") : "success",
+                succeeded,
+                succeededItems,
+                failed: failures,
+                total: items.length
+            };
+        },
+
+        moveToNext(item) {
+            return applyQueueReorder(item, { index: 0 });
+        },
+
+        moveQueueItem(item, targetItem, placement) {
+            if (placement !== "before" && placement !== "after") {
+                return Promise.resolve({ status: "unsupported", reason: "Queue drop position is invalid" });
+            }
+            return applyQueueReorder(item, { item: targetItem, placement });
         },
 
         // `limit` keeps this cheap: a podcast show can have thousands of episodes queued, and the top bar
         // only needs the next one (the full list is only read while the queue panel is open)
-        getQueue(limit = 100) {
+        getQueue(limit = Infinity) {
             const queue = Spicetify.Queue;
             const next = Array.isArray(queue?.nextTracks) ? queue.nextTracks : [];
             const currentUid = queue?.track?.contextTrack?.uid;
+            const revision = queue?.queueRevision ?? Spicetify.Platform?.PlayerAPI?._queue?._queue?.queueRevision;
+            const snapshotSignature = limit === Infinity ? queueStructureSignature(next) : "";
+            const uidCounts = new Map();
+            if (limit === Infinity) {
+                for (const track of next) {
+                    const uid = queueEntryParts(track).uid;
+                    if (uid) uidCounts.set(uid, (uidCounts.get(uid) || 0) + 1);
+                }
+            }
             const items = [];
-            for (const track of next) {
+            for (let queueIndex = 0; queueIndex < next.length; queueIndex++) {
+                const track = next[queueIndex];
                 const contextTrack = track?.contextTrack;
-                if (!contextTrack || (track.removed && track.removed.length) || contextTrack.uid === currentUid) continue;
+                if (!contextTrack || (track.removed && track.removed.length)
+                    || (currentUid && contextTrack.uid === currentUid)) continue;
                 const metadata = contextTrack.metadata || {};
                 const names = [];
                 for (let i = 0; ; i++) {
@@ -1331,7 +1951,7 @@
                 const isEpisode = (contextTrack.uri || "").startsWith("spotify:episode:");
                 const showName = metadata.show_name || metadata.album_title || "";
                 const showUri = metadata.show_uri || metadata.album_uri || "";
-                items.push({
+                const item = {
                     uid: contextTrack.uid,
                     uri: contextTrack.uri,
                     title: metadata.title || metadata.name || "Unknown track",
@@ -1339,8 +1959,14 @@
                     image: queueImageUrl(metadata),
                     albumUri: isEpisode ? showUri : (metadata.album_uri || ""),
                     artistUri: isEpisode ? showUri : (metadata.artist_uri || ""),
-                    fromQueue: track.provider === "queue"
-                });
+                    fromQueue: track.provider === "queue",
+                    uidOccurrenceCount: contextTrack.uid ? (uidCounts.get(String(contextTrack.uid)) || 1) : 0,
+                    queueIndex,
+                    queueRevision: revision
+                };
+                item.identity = queueOccurrenceIdentity(track, queueIndex, next, uidCounts);
+                if (snapshotSignature) item.queueSnapshotSignature = snapshotSignature;
+                items.push(item);
                 if (items.length >= limit) break;
             }
             return items;
@@ -1365,15 +1991,16 @@
             ].join("\u0000");
         }
         if (key === "queue") {
-            return value.map(item => [
-                item.uid || item.uri || "",
+            return JSON.stringify(value.map(item => [
+                item.identity || "",
+                item.uri || "",
                 item.title || "",
                 item.artist || "",
                 item.image || "",
                 item.albumUri || "",
                 item.artistUri || "",
                 item.fromQueue ? "queue" : "context"
-            ].join("\u0000")).join("\u0001");
+            ]));
         }
         return value;
     }
@@ -1437,8 +2064,12 @@
         }
         if (requested.has("shuffle")) patch.shuffle = !!data.shuffle;
         if (requested.has("repeat")) patch.repeat = Number(data.repeat) || 0;
-        if (requested.has("queue")) patch.queue = SpotifyAdapter.getQueue(queueOpen ? 100 : 1);
-        return publishPlayerState(patch);
+        if (requested.has("queue")) patch.queue = SpotifyAdapter.getQueue(queueOpen ? Infinity : 1);
+        const changedKeys = publishPlayerState(patch);
+        if (requested.has("queue") && queueOpen && isPiPWindowOpen()) {
+            updateQueueHeader(pipWindow.document, playerState.queue);
+        }
+        return changedKeys;
     }
 
     function updatePlayerState(patch) {
@@ -1451,8 +2082,95 @@
         return pipResources ? pipResources.addCleanup(unsubscribe) : unsubscribe;
     }
 
-    // Plays exactly this track, with no skipping through the ones before it
+    function reportQueueActionFailure(action, result) {
+        const status = result?.status || "failed";
+        const messages = {
+            unsupported: result.reason || "This queue action isn't supported",
+            "not-found": "That item is no longer in the queue. Refresh and try again.",
+            ambiguous: result.reason || "Spotify couldn't identify that queue occurrence safely",
+            conflict: result.reason || "The queue changed. Refresh it and try again.",
+            failed: result.reason || "Spotify couldn't complete that queue action"
+        };
+        console.warn(`[MiniPlayer] Queue ${action} ${status}:`, result?.reason || "no additional detail");
+        Spicetify.showNotification(messages[status] || `Couldn't ${action} that queue item`, true);
+    }
+
+    // Plays exactly this queue occurrence, without acting on a stale or ambiguous row.
     async function playQueueItem(it) {
+        const playReason = SpotifyAdapter.canPlayNow(it);
+        if (playReason) {
+            reportQueueActionFailure("play", { status: "unsupported", reason: playReason });
+            return;
+        }
+        const target = SpotifyAdapter.resolveQueueItem(it);
+        if (target.status !== "success") {
+            reportQueueActionFailure("play", target);
+            return;
+        }
+        const targetParts = queueEntryParts(target.entry);
+        const queueEntries = Spicetify.Platform?.PlayerAPI?._queue?._queue?.nextTracks
+            || Spicetify.Queue?.nextTracks
+            || [];
+        if (!it.uid && !it.fromQueue
+            && queueEntries.filter(entry => queueEntryParts(entry).uri === it.uri).length > 1) {
+            reportQueueActionFailure("play", {
+                status: "ambiguous",
+                reason: "This context track has duplicate URIs and no occurrence UID"
+            });
+            return;
+        }
+        if (it.fromQueue) {
+            const reorderReason = SpotifyAdapter.canMoveToNext(it);
+            if (reorderReason) {
+                reportQueueActionFailure("play", { status: "unsupported", reason: reorderReason });
+                return;
+            }
+            if (typeof Spicetify.Player?.next !== "function") {
+                reportQueueActionFailure("play", {
+                    status: "unsupported",
+                    reason: "Spotify's Next playback action is unavailable"
+                });
+                return;
+            }
+
+            let reorderResult;
+            try {
+                reorderResult = await SpotifyAdapter.moveToNext(it);
+            } catch (err) {
+                console.warn("[MiniPlayer] Could not move queued item to the front:", err?.message || "unknown error");
+                reportQueueActionFailure("play", { status: "failed", reason: "Spotify couldn't move the item to the front" });
+                return;
+            }
+            if (reorderResult.status !== "already-next"
+                && (reorderResult.status !== "success" || !reorderResult.verified)) {
+                const result = reorderResult.status === "success"
+                    ? {
+                        status: "conflict",
+                        reason: "Spotify did not confirm the item is next; playback was not advanced"
+                    }
+                    : reorderResult;
+                reportQueueActionFailure("play", result);
+                syncPlayerState(["queue"]);
+                return;
+            }
+
+            try {
+                const result = await Spicetify.Player.next();
+                if (result === false) {
+                    reportQueueActionFailure("play", { status: "failed", reason: "Spotify rejected the Next action" });
+                    syncPlayerState(["queue"]);
+                    return;
+                }
+            } catch (err) {
+                console.warn("[MiniPlayer] Could not advance to queued item:", err?.message || "unknown error");
+                reportQueueActionFailure("play", { status: "failed", reason: "Spotify couldn't advance to the queued item" });
+                syncPlayerState(["queue"]);
+                return;
+            }
+            safeSetTimeout(() => syncPlayerState(["currentTrack", "duration", "queue"]), 400);
+            return;
+        }
+
         const data = Spicetify.Player.data;
         const startUri = data?.item?.uri;
         const ctxUri = data?.context?.uri || data?.context_uri || "";
@@ -1464,7 +2182,12 @@
         if (!it.fromQueue && ctxUri) {
             try {
                 await SpotifyAdapter.play(ctxUri, {
-                    skipTo: { uri: it.uri, uid: it.uid, trackUri: it.uri, trackUid: it.uid }
+                    skipTo: {
+                        uri: targetParts.uri,
+                        uid: targetParts.uid || undefined,
+                        trackUri: targetParts.uri,
+                        trackUid: targetParts.uid || undefined
+                    }
                 });
                 for (let i = 0; i < 10; i++) {
                     if (!await sleep(150) || !isPiPWindowOpen()) break;
@@ -1472,15 +2195,17 @@
                     if (cur === it.uri) { ok = true; break; }
                     if (cur && cur !== startUri) break; // something else started: stop waiting
                 }
-            } catch (err) {}
+            } catch (err) {
+                console.warn("[MiniPlayer] Context queue skip failed:", err?.message || "unknown error");
+            }
         }
 
         // Queued tracks (or if the above didn't land): play the track itself
         if (!ok) {
             try {
-                await SpotifyAdapter.play(it.uri);
+                await SpotifyAdapter.play(targetParts.uri);
             } catch (err) {
-                console.warn("[MiniPlayer] Could not play track:", err);
+                console.warn("[MiniPlayer] Could not play queue item:", err?.message || "unknown error");
                 Spicetify.showNotification("Couldn't play that track", true);
             }
         }
@@ -1489,48 +2214,201 @@
 
     async function removeQueueItem(it) {
         try {
-            await SpotifyAdapter.removeFromQueue(it);
+            const result = await SpotifyAdapter.removeFromQueue(it);
+            if (result.status !== "success") {
+                reportQueueActionFailure("remove", result);
+                return;
+            }
         } catch (err) {
-            console.warn("[MiniPlayer] Could not remove from queue:", err);
+            console.warn("[MiniPlayer] Could not remove queue item:", err?.message || "unknown error");
             Spicetify.showNotification("Couldn't remove that track from the queue", true);
             return;
         }
         safeSetTimeout(() => syncPlayerState(["queue"]), 400);
     }
 
+    async function addQueueItem(it) {
+        const result = await SpotifyAdapter.addToQueue(it);
+        if (result.status !== "success") {
+            syncPlayerState(["queue"]);
+            reportQueueActionFailure("add", result);
+            return;
+        }
+        Spicetify.showNotification("Added to queue");
+        safeSetTimeout(() => syncPlayerState(["queue"]), 400);
+    }
+
     async function putQueueItemNext(it) {
         try {
-            const moved = await SpotifyAdapter.moveToNext(it);
-            if (!moved) {
+            const result = await SpotifyAdapter.moveToNext(it);
+            if (result.status === "already-next") {
                 Spicetify.showNotification("That track is already next");
                 return;
             }
+            if (result.status !== "success") {
+                reportQueueActionFailure("reorder", result);
+                return;
+            }
         } catch (err) {
-            console.warn("[MiniPlayer] Could not move track to the front of the queue:", err);
+            console.warn("[MiniPlayer] Could not reorder queue item:", err?.message || "unknown error");
             Spicetify.showNotification("Couldn't put that track next", true);
             return;
         }
         safeSetTimeout(() => syncPlayerState(["queue"]), 400);
     }
 
+    async function moveQueueItemToPosition(item, targetItem, placement) {
+        try {
+            const result = await SpotifyAdapter.moveQueueItem(item, targetItem, placement);
+            syncPlayerState(["queue"]);
+            if (result.status === "already-positioned") return;
+            if (result.status !== "success") reportQueueActionFailure("reorder", result);
+        } catch (err) {
+            syncPlayerState(["queue"]);
+            console.warn("[MiniPlayer] Could not reorder queue item:", err?.message || "unknown error");
+            Spicetify.showNotification("Couldn't reorder that queue item", true);
+        }
+    }
+
+    function clearQueueDrag() {
+        const drag = queueDragState;
+        queueDragState = null;
+        queueDragDisposers.forEach(dispose => dispose?.());
+        queueDragDisposers = [];
+        if (!drag) return;
+
+        drag.row.classList.remove("queue-item-dragging");
+        drag.targetRow?.classList.remove("queue-drop-before", "queue-drop-after");
+        if (drag.started) {
+            drag.row.dataset.suppressQueuePlayback = "true";
+            safeSetTimeout(() => delete drag.row.dataset.suppressQueuePlayback, 300);
+        }
+        try {
+            if (drag.handle.hasPointerCapture(drag.pointerId)) drag.handle.releasePointerCapture(drag.pointerId);
+        } catch (err) {}
+    }
+
+    function updateQueueDrag(event) {
+        const drag = queueDragState;
+        if (!drag || event.pointerId !== drag.pointerId) return;
+        if (!drag.started) {
+            const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+            if (distance < 6) return;
+            drag.started = true;
+            drag.row.classList.add("queue-item-dragging");
+        }
+        event.preventDefault();
+
+        const listRect = drag.list.getBoundingClientRect();
+        if (event.clientY < listRect.top + 24) drag.list.scrollTop -= 8;
+        else if (event.clientY > listRect.bottom - 24) drag.list.scrollTop += 8;
+
+        const hovered = drag.doc.elementFromPoint(event.clientX, event.clientY);
+        const targetRow = hovered?.closest?.(".queue-item");
+        if (!targetRow || !drag.list.contains(targetRow) || targetRow === drag.row) {
+            drag.targetRow?.classList.remove("queue-drop-before", "queue-drop-after");
+            drag.targetRow = null;
+            drag.targetItem = null;
+            return;
+        }
+
+        const targetItem = drag.itemsByIdentity.get(targetRow.dataset.queueIdentity);
+        if (!targetItem || targetItem.identity === drag.item.identity) {
+            drag.targetRow?.classList.remove("queue-drop-before", "queue-drop-after");
+            drag.targetRow = null;
+            drag.targetItem = null;
+            return;
+        }
+        const placement = event.clientY < targetRow.getBoundingClientRect().top + targetRow.offsetHeight / 2
+            ? "before"
+            : "after";
+        if (drag.targetRow !== targetRow || drag.placement !== placement) {
+            drag.targetRow?.classList.remove("queue-drop-before", "queue-drop-after");
+            targetRow.classList.remove("queue-drop-before", "queue-drop-after");
+            targetRow.classList.add(placement === "before" ? "queue-drop-before" : "queue-drop-after");
+        }
+        drag.targetRow = targetRow;
+        drag.targetItem = targetItem;
+        drag.placement = placement;
+    }
+
+    function finishQueueDrag(event, cancelled = false) {
+        const drag = queueDragState;
+        if (!drag || (event && event.pointerId !== drag.pointerId)) return;
+        const shouldMove = !cancelled && drag.started && drag.targetItem;
+        if (drag.started) {
+            event?.preventDefault();
+            event?.stopPropagation();
+        }
+        const { item, targetItem, placement } = drag;
+        clearQueueDrag();
+        if (shouldMove) moveQueueItemToPosition(item, targetItem, placement);
+    }
+
+    function beginQueueDrag(event, item, row, handle, list, itemsByIdentity) {
+        if (event.button !== 0 || event.isPrimary === false || queueDragState) return;
+        const eligibilityReason = SpotifyAdapter.canMoveToNext(item);
+        if (eligibilityReason) return;
+        const resolved = SpotifyAdapter.resolveQueueItem(item);
+        if (resolved.status !== "success" || queueEntryParts(resolved.entry).source !== "queue") {
+            syncPlayerState(["queue"]);
+            reportQueueActionFailure("reorder", resolved.status === "success"
+                ? { status: "unsupported", reason: "Only manually queued items can be reordered" }
+                : resolved);
+            return;
+        }
+        event.stopPropagation();
+
+        const doc = pipWindow.document;
+        queueDragState = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            started: false,
+            item,
+            row,
+            handle,
+            list,
+            doc,
+            itemsByIdentity,
+            targetRow: null,
+            targetItem: null,
+            placement: null
+        };
+        queueDragDisposers = [
+            listenPiP(doc, "pointermove", updateQueueDrag, { capture: true }),
+            listenPiP(doc, "pointerup", event => finishQueueDrag(event), { capture: true }),
+            listenPiP(doc, "pointercancel", event => finishQueueDrag(event, true), { capture: true }),
+            listenPiP(handle, "lostpointercapture", event => finishQueueDrag(event, true)),
+            listenPiP(pipWindow, "blur", () => finishQueueDrag(null, true))
+        ];
+        try {
+            handle.setPointerCapture(event.pointerId);
+        } catch (err) {}
+    }
+
     async function copyTrackLink(it) {
-        const uri = String(it.uri || "");
-        const resource = /^spotify:(track|episode):([A-Za-z0-9]+)$/.exec(uri);
-        const isLocal = uri.startsWith("spotify:local:");
-        const link = resource
-            ? `https://open.spotify.com/${resource[1]}/${resource[2]}`
-            : isLocal ? uri : "";
+        const link = shareableSpotifyLink(it.uri);
         if (!link) {
-            Spicetify.showNotification("No link is available for this item", true);
             return;
         }
         try {
             if (Spicetify.Platform?.ClipboardAPI?.copy) await Spicetify.Platform.ClipboardAPI.copy(link);
             else await navigator.clipboard.writeText(link);
-            Spicetify.showNotification(isLocal ? "Spotify URI copied" : "Link copied");
+            Spicetify.showNotification("Link copied");
         } catch (err) {
             Spicetify.showNotification("Couldn't copy the link", true);
         }
+    }
+
+    function canCopySpotifyLink(item) {
+        if (!shareableSpotifyLink(item?.uri)) return "No shareable Spotify link is available for this item";
+        const hasPlatformClipboard = typeof Spicetify.Platform?.ClipboardAPI?.copy === "function";
+        const hasBrowserClipboard = typeof navigator !== "undefined"
+            && typeof navigator.clipboard?.writeText === "function";
+        return hasPlatformClipboard || hasBrowserClipboard
+            ? ""
+            : "Clipboard access is unavailable";
     }
 
     // The three-dots menu on a queue row
@@ -1550,12 +2428,15 @@
 
         const menu = doc.createElement("div");
         menu.className = "queue-menu";
-        menu.dataset.uid = String(it.uid || it.uri);
-        const add = (label, handler) => {
+        menu.dataset.identity = it.identity;
+        const add = (label, handler, disabledReason = "") => {
             const b = doc.createElement("button");
             b.className = "queue-menu-item";
             b.textContent = label;
+            b.disabled = !!disabledReason;
+            if (disabledReason) b.title = disabledReason;
             queueMenuDisposers.push(listenPiP(b, "click", (e) => {
+                if (b.disabled) return;
                 e.stopPropagation();
                 closeQueueMenu();
                 handler();
@@ -1568,21 +2449,32 @@
             menu.appendChild(s);
         };
 
-        add("Put in next", () => putQueueItemNext(it));
-        add("Play now", () => playQueueItem(it));
-        if (it.fromQueue) add("Remove from queue", () => removeQueueItem(it));
+        const reorderReason = SpotifyAdapter.canMoveToNext(it);
+        add("Add to queue", () => addQueueItem(it), SpotifyAdapter.canAddToQueue(it));
+        add("Play next", () => putQueueItemNext(it), reorderReason);
+        add("Play now", () => playQueueItem(it), SpotifyAdapter.canPlayNow(it));
+        const removeReason = SpotifyAdapter.canRemoveFromQueue(it);
+        add("Remove from queue", () => removeQueueItem(it), removeReason);
         if (it.albumUri || it.artistUri) sep();
         // Podcast episodes link to their show, which is both the "album" and the "artist"
         const isShow = (it.albumUri || "").startsWith("spotify:show:");
-        if (it.albumUri) add(isShow ? "Go to show" : "Go to album", () => openInSpotify(it.albumUri));
-        if (it.artistUri && it.artistUri !== it.albumUri) add("Go to artist", () => openInSpotify(it.artistUri));
+        if (it.albumUri) {
+            const expectedTypes = isShow ? ["show"] : ["album"];
+            const reason = SpotifyAdapter.canOpenSpotifyPage(it.albumUri, expectedTypes);
+            add(isShow ? "Go to show" : "Go to album", () => openInSpotify(it.albumUri), reason);
+        }
+        if (it.artistUri && it.artistUri !== it.albumUri) {
+            const reason = SpotifyAdapter.canOpenSpotifyPage(it.artistUri, ["artist"]);
+            add("Go to artist", () => openInSpotify(it.artistUri), reason);
+        }
         sep();
-        add(it.uri?.startsWith("spotify:local:") ? "Copy Spotify URI" : "Copy link", () => copyTrackLink(it));
+        add("Copy Spotify link", () => copyTrackLink(it), canCopySpotifyLink(it));
 
+        menu.style.maxHeight = `${Math.max(1, pipWindow.innerHeight - 16)}px`;
         doc.body.appendChild(menu);
         anchor.classList.add("active");
 
-        // Keep the queue's three-dot column clear; flip above if there's no room below.
+        // Keep the menu inside the PiP viewport; scroll it when neither side has enough room.
         const r = anchor.getBoundingClientRect();
         const mw = menu.offsetWidth;
         const mh = menu.offsetHeight;
@@ -1591,11 +2483,270 @@
         let left = r.left - mw - 4;
         if (left < 8) left = Math.min(r.right + 4, W - mw - 8);
         left = Math.max(8, left);
-        let top = r.bottom + 4;
-        if (top + mh > H - 8) top = Math.max(8, r.top - mh - 4);
+        const fitsBelow = r.bottom + 4 + mh <= H - 8;
+        const fitsAbove = r.top - mh - 4 >= 8;
+        let top = fitsBelow ? r.bottom + 4 : fitsAbove ? r.top - mh - 4 : 8;
+        top = Math.min(Math.max(8, top), Math.max(8, H - mh - 8));
         menu.style.left = `${left}px`;
         menu.style.top = `${top}px`;
         queueMenuEl = menu;
+    }
+
+    function updateQueueSelectionToolbar(doc = pipWindow?.document) {
+        const selectButton = doc?.getElementById("queue-select-items");
+        const countLabel = doc?.getElementById("queue-selection-count");
+        const removeButton = doc?.getElementById("queue-remove-selected");
+        const confirmButton = doc?.getElementById("queue-confirm-remove");
+        const keepButton = doc?.getElementById("queue-keep-selection");
+        const cancelButton = doc?.getElementById("queue-cancel-selection");
+        if (!selectButton || !countLabel || !removeButton || !confirmButton || !keepButton || !cancelButton) return;
+
+        const count = queueSelectedItems.size;
+        selectButton.hidden = queueSelectionMode;
+        countLabel.hidden = !queueSelectionMode;
+        countLabel.textContent = queueBulkRemoving
+            ? `Removing ${count} item${count === 1 ? "" : "s"}...`
+            : queueBulkConfirm
+                ? `Remove ${count} selected items?`
+                : `${count} selected`;
+        removeButton.hidden = !queueSelectionMode || queueBulkConfirm;
+        removeButton.disabled = !count || queueBulkRemoving;
+        confirmButton.hidden = !queueBulkConfirm;
+        confirmButton.disabled = queueBulkRemoving;
+        keepButton.hidden = !queueBulkConfirm;
+        keepButton.disabled = queueBulkRemoving;
+        cancelButton.hidden = !queueSelectionMode;
+        cancelButton.disabled = queueBulkRemoving;
+    }
+
+    function beginQueueSelectionMode() {
+        if (queueBulkRemoving) return;
+        queueSelectionMode = true;
+        queueSelectedItems.clear();
+        queueBulkConfirm = false;
+        renderQueuePanel(true);
+    }
+
+    function endQueueSelectionMode() {
+        if (queueBulkRemoving) return;
+        queueSelectionMode = false;
+        queueSelectedItems.clear();
+        queueBulkConfirm = false;
+        renderQueuePanel(true);
+    }
+
+    function toggleQueueItemSelection(item, row) {
+        if (!queueSelectionMode || !item?.fromQueue || queueBulkRemoving) return;
+        const reason = SpotifyAdapter.canBulkRemoveFromQueue(item);
+        if (reason) {
+            Spicetify.showNotification(reason, true);
+            return;
+        }
+
+        if (queueSelectedItems.has(item.identity)) queueSelectedItems.delete(item.identity);
+        else queueSelectedItems.set(item.identity, item);
+        queueBulkConfirm = false;
+        const selected = queueSelectedItems.has(item.identity);
+        row.classList.toggle("queue-item-selected", selected);
+        const control = row.querySelector(".queue-selection-toggle");
+        if (control) {
+            control.setAttribute("aria-pressed", String(selected));
+            control.setAttribute("aria-label", `${selected ? "Deselect" : "Select"} ${item.title} for removal`);
+        }
+        updateQueueSelectionToolbar();
+    }
+
+    function requestBulkQueueRemoval() {
+        if (queueBulkRemoving || !queueSelectedItems.size) return;
+        if (queueSelectedItems.size > 1) {
+            queueBulkConfirm = true;
+            updateQueueSelectionToolbar();
+            return;
+        }
+        void removeSelectedQueueItems();
+    }
+
+    async function removeSelectedQueueItems() {
+        if (queueBulkRemoving || !queueSelectedItems.size) return;
+        const selected = Array.from(queueSelectedItems.values());
+        queueBulkRemoving = true;
+        queueBulkConfirm = false;
+        updateQueueSelectionToolbar();
+
+        let result;
+        try {
+            result = await SpotifyAdapter.removeManyFromQueue(selected);
+        } catch (error) {
+            console.warn("[MiniPlayer] Bulk queue removal failed:", error?.message || "unknown error");
+            result = {
+                status: "failed",
+                succeeded: 0,
+                succeededItems: [],
+                failed: [{ reason: "Spotify's bulk removal request failed" }],
+                total: selected.length
+            };
+        }
+
+        for (const item of result.succeededItems || []) queueSelectedItems.delete(item.identity);
+        queueBulkRemoving = false;
+        queueBulkConfirm = false;
+        if (result.status === "success" || !queueSelectedItems.size) {
+            queueSelectionMode = false;
+            queueSelectedItems.clear();
+        }
+        if (result.status === "success") {
+            Spicetify.showNotification(`Removed ${result.succeeded} item${result.succeeded === 1 ? "" : "s"} from queue`);
+        } else if (result.status === "partial") {
+            Spicetify.showNotification(
+                `Removed ${result.succeeded} of ${result.total} items; ${result.total - result.succeeded} couldn't be removed`,
+                true
+            );
+        } else {
+            const reason = result.failed?.[0]?.reason;
+            Spicetify.showNotification(reason || "Couldn't remove the selected queue items", true);
+        }
+
+        syncPlayerState(["queue"]);
+        if (queueSelectionMode && !queueSelectedItems.size) {
+            queueSelectionMode = false;
+            queueBulkConfirm = false;
+        }
+        if (queueOpen) renderQueuePanel(true);
+    }
+
+    function queueItemVisibleSignature(item) {
+        return JSON.stringify([
+            item.identity || "",
+            item.uri || "",
+            item.title || "",
+            item.artist || "",
+            item.image || "",
+            item.albumUri || "",
+            item.artistUri || "",
+            item.fromQueue ? "queue" : "context"
+        ]);
+    }
+
+    function updateQueueHeader(doc, items) {
+        const queueCount = doc?.getElementById("queue-count");
+        const queueSourceNote = doc?.getElementById("queue-source-note");
+        const rawQueueLength = Array.isArray(Spicetify.Queue?.nextTracks)
+            ? Spicetify.Queue.nextTracks.length
+            : items.length;
+        const snapshotMayBeTruncated = rawQueueLength >= QUEUE_SNAPSHOT_WARNING_THRESHOLD;
+        if (queueCount) {
+            queueCount.textContent = items.length >= QUEUE_SNAPSHOT_WARNING_THRESHOLD
+                ? `${items.length}+`
+                : String(items.length);
+            queueCount.title = `${items.length} items are exposed in Spotify's current queue snapshot`;
+        }
+        if (queueSourceNote) {
+            queueSourceNote.textContent = snapshotMayBeTruncated
+                ? `Spotify's queue snapshot has reached ${QUEUE_SNAPSHOT_WARNING_THRESHOLD} entries. Its documented API has no pagination, so the full queue may be larger.`
+                : `Showing all ${items.length} items exposed by Spotify's current queue snapshot. The documented API has no pagination.`;
+        }
+    }
+
+    function updateNowPlayingRow(doc) {
+        const row = doc?.getElementById("queue-now-playing");
+        if (!row || !queueOpen) return;
+        const item = playerState.currentTrack;
+        row.hidden = !item;
+        if (!item) return;
+
+        const metadata = getTrackMetadata();
+        const image = row.querySelector(".queue-now-playing-image");
+        const title = row.querySelector(".queue-now-playing-title");
+        const artist = row.querySelector(".queue-now-playing-artist");
+        if (image) {
+            if (metadata.cover) image.src = metadata.cover;
+            else image.removeAttribute("src");
+        }
+        if (title) title.textContent = metadata.title;
+        if (artist) artist.textContent = metadata.artist;
+        row.classList.toggle("is-playing", !!playerState.isPlaying);
+        row.setAttribute("aria-label", `Now playing: ${metadata.title} · ${metadata.artist}`);
+    }
+
+    function finishQueueHeadRemoval() {
+        const pending = queueHeadRemoval;
+        if (!pending) return;
+        queueHeadRemoval = null;
+        pending.animation.cancel();
+        pending.row.remove();
+    }
+
+    function patchConsumedQueueHead(list, items, key) {
+        const previous = renderedQueueItems;
+        if (queueSelectionMode || queueBulkRemoving || queueDragState || queueMenuEl
+            || !previous?.length || items.length !== previous.length - 1 || !items.length) return false;
+
+        const hasStableIdentity = item => item.uid
+            && item.uidOccurrenceCount === 1
+            && item.identity === `uid:${item.uid}`;
+        if (!previous.every(hasStableIdentity) || !items.every(hasStableIdentity)) return false;
+        for (let index = 0; index < items.length; index++) {
+            if (previous[index + 1].identity !== items[index].identity
+                || queueItemVisibleSignature(previous[index + 1]) !== queueItemVisibleSignature(items[index])) {
+                return false;
+            }
+        }
+
+        const rows = [...list.querySelectorAll(".queue-item")];
+        if (rows.length !== previous.length
+            || rows.some((row, index) => row.dataset.queueIdentity !== previous[index].identity)) return false;
+
+        const head = rows[0];
+        const headDisposers = queueRowDisposers.get(previous[0].identity) || [];
+        headDisposers.forEach(dispose => dispose?.());
+        queueRowDisposers.delete(previous[0].identity);
+        const removedDisposers = new Set(headDisposers);
+        queueRenderDisposers = queueRenderDisposers.filter(dispose => !removedDisposers.has(dispose));
+
+        const previousHeading = head.previousElementSibling;
+        if (previousHeading?.classList.contains("queue-group")
+            && head.nextElementSibling?.classList.contains("queue-group")) {
+            previousHeading.remove();
+        }
+
+        lastQueueKey = key;
+        renderedQueueItems = items.slice();
+
+        const duration = pipWindow.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? 0 : 140;
+        if (typeof head.animate !== "function") {
+            head.remove();
+            return true;
+        }
+
+        head.style.overflow = "hidden";
+        head.style.boxSizing = "border-box";
+        const height = head.getBoundingClientRect().height;
+        const animation = head.animate([
+            {
+                height: `${height}px`,
+                minHeight: `${height}px`,
+                paddingTop: "5px",
+                paddingBottom: "5px",
+                opacity: 1,
+                transform: "translateY(0)"
+            },
+            {
+                height: "0px",
+                minHeight: "0px",
+                paddingTop: "0px",
+                paddingBottom: "0px",
+                opacity: 0,
+                transform: "translateY(-4px)"
+            }
+        ], { duration, easing: "ease", fill: "forwards" });
+        const pending = { row: head, animation };
+        queueHeadRemoval = pending;
+        animation.finished.then(() => {
+            if (queueHeadRemoval !== pending) return;
+            head.remove();
+            queueHeadRemoval = null;
+        }).catch(() => {});
+        return true;
     }
 
     // Rebuilds the list only when the queue actually changed, keeping the scroll position
@@ -1603,21 +2754,41 @@
         if (!isPiPWindowOpen() || !queueOpen) return;
         const doc = pipWindow.document;
         const list = doc.getElementById("queue-list");
-        const count = doc.getElementById("queue-count");
-        if (!list || !count) return;
+        if (!list) return;
 
         const items = playerState.queue;
-        const key = items.map(i => i.uid || i.uri).join("|");
+        const key = playerStateKey("queue", items);
+        updateNowPlayingRow(doc);
+        updateQueueHeader(doc, items);
         if (!force && key === lastQueueKey) return;
+        finishQueueHeadRemoval();
+        if (!force && patchConsumedQueueHead(list, items, key)) return;
         lastQueueKey = key;
+        if (!queueBulkRemoving) {
+            const currentItems = new Map(items.filter(item => item.fromQueue).map(item => [item.identity, item]));
+            for (const [identity, selected] of queueSelectedItems) {
+                const current = currentItems.get(identity);
+                if (!current || current.uri !== selected.uri || current.uid !== selected.uid
+                    || (!current.uid && current.queueSnapshotSignature !== selected.queueSnapshotSignature)) {
+                    queueSelectedItems.delete(identity);
+                } else {
+                    queueSelectedItems.set(identity, current);
+                }
+            }
+            if (queueSelectedItems.size < 2) queueBulkConfirm = false;
+        }
+        updateQueueSelectionToolbar(doc);
         closeQueueMenu(); // the row it belonged to is about to be rebuilt
         const hasQueuedItems = items.some(item => item.fromQueue);
+        const itemsByIdentity = new Map(items.map(item => [item.identity, item]));
 
         const scrollTop = list.scrollTop;
+        clearQueueDrag();
         queueRenderDisposers.forEach(dispose => dispose?.());
         queueRenderDisposers = [];
+        queueRowDisposers.clear();
+        renderedQueueItems = null;
         list.textContent = "";
-        count.textContent = items.length ? String(items.length) : "";
         const generation = ++queueRenderGeneration;
 
         if (!items.length) {
@@ -1625,6 +2796,7 @@
             empty.className = "queue-empty";
             empty.textContent = "Nothing in the queue";
             list.appendChild(empty);
+            renderedQueueItems = [];
             return;
         }
 
@@ -1641,18 +2813,59 @@
                     && (group !== "Next up" || hasQueuedItems)) {
                     const heading = doc.createElement("div");
                     heading.className = "queue-group";
+                    heading.setAttribute("role", "heading");
+                    heading.setAttribute("aria-level", "3");
                     heading.textContent = group;
                     fragment.appendChild(heading);
                 }
                 lastGroup = group;
                 const row = doc.createElement("div");
+                const rowDisposers = [];
+                const listenRow = (target, type, handler) => {
+                    const dispose = listenPiP(target, type, handler);
+                    queueRenderDisposers.push(dispose);
+                    rowDisposers.push(dispose);
+                };
                 row.className = "queue-item";
-                row.title = "Play this track";
+                const itemLabel = `${it.title}${it.artist ? ` · ${it.artist}` : ""}`;
+                const itemType = it.uri.startsWith("spotify:episode:") ? "episode" : "track";
+                row.setAttribute("role", "listitem");
+                row.setAttribute("aria-label", `${itemLabel}, ${itemType}${it.fromQueue ? ", manually queued" : ""}`);
+                row.tabIndex = 0;
+                row.title = queueSelectionMode
+                    ? it.fromQueue
+                        ? `Click to select ${itemLabel} for removal`
+                        : `Only manually queued items can be selected for removal: ${itemLabel}`
+                    : `Play ${itemType}: ${itemLabel}`;
+                row.dataset.queueIdentity = it.identity;
+                if (queueSelectionMode) {
+                    row.classList.add("queue-selection-active");
+                    if (it.fromQueue) {
+                        const removeReason = SpotifyAdapter.canRemoveFromQueue(it);
+                        const selected = queueSelectedItems.has(it.identity);
+                        const selectionToggle = doc.createElement("button");
+                        selectionToggle.type = "button";
+                        selectionToggle.className = "queue-selection-toggle";
+                        selectionToggle.disabled = !!removeReason;
+                        selectionToggle.title = removeReason || (selected ? "Deselect item" : "Select for bulk removal");
+                        selectionToggle.setAttribute("aria-label", `${selected ? "Deselect" : "Select"} ${it.title} for removal`);
+                        selectionToggle.setAttribute("aria-pressed", String(selected));
+                        row.classList.toggle("queue-item-selected", selected);
+                        listenRow(selectionToggle, "click", event => {
+                            event.stopPropagation();
+                            toggleQueueItemSelection(it, row);
+                        });
+                        row.appendChild(selectionToggle);
+                    } else {
+                        row.classList.add("queue-selection-disabled");
+                    }
+                }
 
                 const img = doc.createElement("img");
                 img.className = "queue-img";
                 img.alt = "";
                 img.draggable = false;
+                img.loading = "lazy";
                 if (it.image) img.src = it.image;
                 row.appendChild(img);
 
@@ -1668,25 +2881,102 @@
                 text.appendChild(artist);
                 row.appendChild(text);
 
+                if (it.fromQueue && currentMode !== "standard") {
+                    const sourceBadge = doc.createElement("span");
+                    sourceBadge.className = "queue-source-badge";
+                    sourceBadge.textContent = "Queued";
+                    sourceBadge.title = "Manually added to queue";
+                    sourceBadge.setAttribute("aria-hidden", "true");
+                    row.appendChild(sourceBadge);
+                }
+
+                if (!queueSelectionMode && !SpotifyAdapter.canMoveToNext(it)) {
+                    const dragHandle = doc.createElement("span");
+                    dragHandle.className = "queue-drag-handle";
+                    dragHandle.title = "Drag to reorder";
+                    dragHandle.setAttribute("aria-hidden", "true");
+                    listenRow(dragHandle, "pointerdown", event => {
+                        beginQueueDrag(event, it, row, dragHandle, list, itemsByIdentity);
+                    });
+                    listenRow(dragHandle, "dragstart", event => event.preventDefault());
+                    row.appendChild(dragHandle);
+                }
+
                 const more = doc.createElement("button");
                 more.className = "queue-more";
                 more.title = "More";
                 more.innerHTML = ICONS.more;
-                queueRenderDisposers.push(listenPiP(more, "click", (e) => {
+                listenRow(more, "click", (e) => {
                     e.stopPropagation();
-                    if (queueMenuEl && queueMenuEl.dataset.uid === String(it.uid || it.uri)) {
+                    if (queueMenuEl && queueMenuEl.dataset.identity === it.identity) {
                         closeQueueMenu();
                         return;
                     }
                     openQueueMenu(it, more);
-                }));
+                });
                 row.appendChild(more);
-                queueRenderDisposers.push(listenPiP(row, "click", () => playQueueItem(it)));
+                listenRow(row, "click", event => {
+                    if (event.target?.closest?.(".queue-drag-handle") || row.dataset.suppressQueuePlayback === "true") {
+                        delete row.dataset.suppressQueuePlayback;
+                        event.preventDefault();
+                        event.stopPropagation();
+                        return;
+                    }
+                    if (queueSelectionMode) {
+                        if (it.fromQueue) toggleQueueItemSelection(it, row);
+                        return;
+                    }
+                    playQueueItem(it);
+                });
+                listenRow(row, "keydown", event => {
+                    if (event.target !== row) return;
+                    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                        const rows = [...list.querySelectorAll(".queue-item")];
+                        const rowIndex = rows.indexOf(row);
+                        const nextRow = rows[rowIndex + (event.key === "ArrowUp" ? -1 : 1)];
+                        if (nextRow) {
+                            event.preventDefault();
+                            nextRow.focus();
+                        }
+                        return;
+                    }
+
+                    if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        if (queueSelectionMode) {
+                            if (it.fromQueue) toggleQueueItemSelection(it, row);
+                        } else {
+                            playQueueItem(it);
+                        }
+                        return;
+                    }
+
+                    if (event.key !== "Delete" || event.repeat) return;
+                    event.preventDefault();
+                    if (queueSelectionMode) {
+                        if (it.fromQueue) {
+                            if (queueSelectedItems.has(it.identity)) requestBulkQueueRemoval();
+                            else toggleQueueItemSelection(it, row);
+                        }
+                        return;
+                    }
+
+                    const removeReason = SpotifyAdapter.canRemoveFromQueue(it);
+                    if (removeReason) {
+                        reportQueueActionFailure("remove", { status: "unsupported", reason: removeReason });
+                    } else {
+                        void removeQueueItem(it);
+                    }
+                });
+                queueRowDisposers.set(it.identity, rowDisposers);
                 fragment.appendChild(row);
             }
             list.appendChild(fragment);
             if (index < items.length) pipResources?.requestAnimationFrame(renderBatch);
-            else list.scrollTop = scrollTop;
+            else {
+                list.scrollTop = scrollTop;
+                renderedQueueItems = items.slice();
+            }
         };
         renderBatch();
     }
@@ -1697,9 +2987,12 @@
         const doc = pipWindow.document;
         closeQueueMenu();
         if (!queueOpen) {
+            finishQueueHeadRemoval();
             queueRenderGeneration++;
             queueRenderDisposers.forEach(dispose => dispose?.());
             queueRenderDisposers = [];
+            queueRowDisposers.clear();
+            renderedQueueItems = null;
         }
         doc.body.classList.toggle("queue-open", queueOpen);
         doc.getElementById("btn-queue")?.classList.toggle("active", queueOpen);
@@ -1711,13 +3004,16 @@
 
     // Opens an album/artist page in the main Spotify window
     function openInSpotify(uri) {
-        const m = /^spotify:(album|artist|playlist|show|episode|track):([A-Za-z0-9]+)/.exec(uri || "");
-        if (!m) return;
+        const resource = parseSpotifyResource(uri);
+        const history = Spicetify.Platform?.History;
+        if (!resource || typeof history?.push !== "function") return false;
         try {
-            Spicetify.Platform.History.push(`/${m[1]}/${m[2]}`);
+            history.push(`/${resource.type}/${resource.id}`);
             window.focus();
+            return true;
         } catch (err) {
             console.warn("[MiniPlayer] Could not open page in Spotify:", err);
+            return false;
         }
     }
 
@@ -1895,7 +3191,7 @@
         if (!el || el.id === "miniplayer-playbar-btn") return false;
         const testId = (el.getAttribute("data-testid") || "").toLowerCase();
         if (testId && NATIVE_MINIPLAYER_TESTIDS.includes(testId)) return true;
-        // Exact match only, so our own "Mini Player (Alt+M)" / "Mini Player Settings" buttons never count
+        // Exact match only, so our own shortcut label and settings button never count
         const label = (el.getAttribute("aria-label") || "").toLowerCase().replace(/[\s_-]+/g, "");
         return !!label && NATIVE_MINIPLAYER_LABELS.includes(label);
     }
@@ -2047,19 +3343,165 @@
                 visibility: hidden;
                 pointer-events: none;
             }
+            /* Header: title + count on the left, "Select" on the right. While selecting, the toolbar takes the row. */
             .queue-header {
                 display: flex;
-                align-items: baseline;
+                flex: 0 0 auto;
+                align-items: center;
+                justify-content: space-between;
                 gap: 8px;
-                padding: 10px 14px 4px;
-                font-size: 13px;
-                font-weight: 700;
+                min-height: 40px;
+                padding: 8px 10px 4px 14px;
+            }
+            .queue-heading {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                min-width: 0;
+            }
+            .queue-title {
                 color: #ffffff;
+                font-size: 15px;
+                font-weight: 700;
+                letter-spacing: -0.01em;
             }
             .queue-count {
+                padding: 1px 7px;
+                border-radius: 999px;
+                background: rgba(255, 255, 255, 0.1);
+                color: #b3b3b3;
+                font-size: 10px;
+                font-weight: 700;
+                font-variant-numeric: tabular-nums;
+            }
+            .queue-header:has(#queue-cancel-selection:not([hidden])) .queue-heading {
+                display: none;
+            }
+            .queue-header:has(#queue-cancel-selection:not([hidden])) .queue-selection-toolbar {
+                flex: 1 1 auto;
+            }
+            .queue-selection-toolbar {
+                display: flex;
+                flex: 0 1 auto;
+                align-items: center;
+                justify-content: flex-end;
+                gap: 6px;
+                min-width: 0;
+            }
+            .queue-selection-toolbar [hidden] {
+                display: none !important;
+            }
+            .queue-selection-toolbar button {
+                flex: 0 0 auto;
+                padding: 4px 12px;
+                border: 1px solid transparent;
+                border-radius: 999px;
+                background: transparent;
+                color: #b3b3b3;
+                font-family: inherit;
                 font-size: 11px;
-                font-weight: 500;
-                color: #a7a7a7;
+                font-weight: 700;
+                cursor: pointer;
+                transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease, transform 0.1s ease;
+            }
+            .queue-selection-toolbar button:hover:not(:disabled) {
+                color: #ffffff;
+                transform: scale(1.04);
+            }
+            .queue-selection-toolbar button:disabled {
+                opacity: 0.4;
+                cursor: default;
+            }
+            #queue-select-items {
+                background: rgba(255, 255, 255, 0.08);
+                color: #ffffff;
+            }
+            #queue-select-items:hover:not(:disabled) {
+                background: rgba(255, 255, 255, 0.14);
+            }
+            #queue-remove-selected {
+                border-color: #727272;
+                color: #ffffff;
+            }
+            #queue-remove-selected:hover:not(:disabled) {
+                border-color: #ffffff;
+            }
+            #queue-confirm-remove {
+                background: #ffffff;
+                color: #000000;
+            }
+            .queue-selection-count {
+                flex: 1 1 auto;
+                min-width: 0;
+                overflow: hidden;
+                color: #ffffff;
+                font-size: 12px;
+                font-weight: 700;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            /* "Now playing" card, like Spotify's own queue */
+            .queue-now-playing {
+                display: flex;
+                flex: 0 0 auto;
+                align-items: center;
+                gap: 12px;
+                margin: 2px 8px 6px;
+                padding: 8px 10px;
+                border-radius: 8px;
+                background: rgba(255, 255, 255, 0.06);
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            .queue-now-playing[hidden] { display: none; }
+            .queue-now-label {
+                margin-bottom: 1px;
+                color: #1ed760;
+                font-size: 9px;
+                font-weight: 700;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+            }
+            .queue-now-playing .queue-name { color: #1ed760; }
+            .queue-playing-bars {
+                display: flex;
+                flex: 0 0 14px;
+                align-items: flex-end;
+                justify-content: center;
+                gap: 2px;
+                width: 14px;
+                height: 16px;
+            }
+            .queue-playing-bars i {
+                width: 2px;
+                border-radius: 2px;
+                background: #1ed760;
+                transform: scaleY(0.55);
+                transform-origin: bottom;
+            }
+            .queue-playing-bars i:nth-child(1) { height: 7px; }
+            .queue-playing-bars i:nth-child(2) { height: 13px; }
+            .queue-playing-bars i:nth-child(3) { height: 9px; }
+            .queue-playing-bars i:nth-child(4) { height: 5px; }
+            .queue-now-playing.is-playing .queue-playing-bars i {
+                animation: queue-playing-bars 0.7s ease-in-out infinite alternate;
+            }
+            .queue-now-playing.is-playing .queue-playing-bars i:nth-child(2) { animation-delay: 0.18s; }
+            .queue-now-playing.is-playing .queue-playing-bars i:nth-child(3) { animation-delay: 0.32s; }
+            .queue-now-playing.is-playing .queue-playing-bars i:nth-child(4) { animation-delay: 0.1s; }
+            @keyframes queue-playing-bars {
+                to { transform: scaleY(1); }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                .queue-now-playing.is-playing .queue-playing-bars i { animation: none; }
+            }
+            .queue-source-note {
+                flex: 0 0 auto;
+                padding: 7px 14px 9px;
+                border-top: 1px solid rgba(255, 255, 255, 0.06);
+                color: rgba(255, 255, 255, 0.4);
+                font-size: 10px;
+                line-height: 1.35;
             }
             .queue-list {
                 flex: 1 1 auto;
@@ -2084,52 +3526,173 @@
             }
             .queue-list:hover::-webkit-scrollbar-thumb { background-color: rgba(255, 255, 255, 0.3); }
             .queue-list::-webkit-scrollbar-thumb:hover { background-color: rgba(255, 255, 255, 0.55); }
+            /* Section headings stay pinned while you scroll their rows */
             .queue-group {
-                padding: 8px 6px 4px;
-                font-size: 11px;
+                position: sticky;
+                top: 0;
+                z-index: 2;
+                padding: 10px 8px 6px;
+                background: linear-gradient(rgba(18, 18, 18, 0.97), rgba(18, 18, 18, 0.9));
+                color: #ffffff;
+                font-size: 12px;
                 font-weight: 700;
-                letter-spacing: 0.02em;
-                color: #a7a7a7;
             }
             .queue-item {
                 display: flex;
+                position: relative;
                 align-items: center;
-                gap: 10px;
-                padding: 5px 6px;
-                min-height: 44px;
+                gap: 12px;
+                padding: 6px 8px;
+                min-height: 52px;
                 border-radius: 6px;
                 cursor: pointer;
+                user-select: none;
+                -webkit-user-select: none;
+                content-visibility: auto;
+                contain-intrinsic-size: auto 52px;
+                transition: background 0.12s ease;
             }
             .queue-item:hover {
-                background: rgba(255, 255, 255, 0.08);
+                background: rgba(255, 255, 255, 0.1);
             }
+            .queue-item:hover .queue-artist {
+                color: #ffffff;
+            }
+            .queue-item:focus-visible {
+                outline: 2px solid #1ed760;
+                outline-offset: -2px;
+            }
+            .queue-item.queue-selection-active {
+                cursor: pointer;
+            }
+            .queue-item.queue-selection-disabled {
+                cursor: default;
+                opacity: 0.55;
+            }
+            .queue-item.queue-item-selected {
+                background: rgba(30, 215, 96, 0.12);
+                box-shadow: inset 0 0 0 1px rgba(30, 215, 96, 0.3);
+            }
+            .queue-selection-toggle {
+                display: flex;
+                flex: 0 0 18px;
+                align-items: center;
+                justify-content: center;
+                width: 18px;
+                height: 18px;
+                padding: 0;
+                border: 1.5px solid rgba(255, 255, 255, 0.5);
+                border-radius: 50%;
+                background: transparent;
+                cursor: pointer;
+                transition: border-color 0.12s ease, background 0.12s ease;
+            }
+            .queue-selection-toggle:hover:not(:disabled) {
+                border-color: #ffffff;
+            }
+            .queue-selection-toggle[aria-pressed="true"] {
+                border-color: #1ed760;
+                background: #1ed760;
+            }
+            .queue-selection-toggle[aria-pressed="true"]::after {
+                width: 4px;
+                height: 8px;
+                border: solid #121212;
+                border-width: 0 2px 2px 0;
+                content: "";
+                transform: rotate(45deg);
+                margin-top: -2px;
+            }
+            .queue-selection-toggle:disabled {
+                opacity: 0.35;
+                cursor: default;
+            }
+            .queue-item-dragging {
+                opacity: 0.5;
+                background: rgba(255, 255, 255, 0.1);
+            }
+            .queue-item.queue-drop-before::before,
+            .queue-item.queue-drop-after::after {
+                content: "";
+                position: absolute;
+                z-index: 1;
+                left: 8px;
+                right: 8px;
+                height: 2px;
+                border-radius: 2px;
+                background: #1ed760;
+                box-shadow: 0 0 7px rgba(30, 215, 96, 0.55);
+                pointer-events: none;
+            }
+            .queue-item.queue-drop-before::before { top: -1px; }
+            .queue-item.queue-drop-after::after { bottom: -1px; }
+            /* Grip appears on hover so the list stays clean at rest */
+            .queue-drag-handle {
+                flex: 0 0 12px;
+                width: 12px;
+                height: 28px;
+                margin-right: -4px;
+                padding: 0;
+                border: 0;
+                border-radius: 3px;
+                background-color: transparent;
+                background-image: radial-gradient(circle, rgba(167, 167, 167, 0.78) 1px, transparent 1.4px);
+                background-position: center;
+                background-size: 4px 5px;
+                opacity: 0;
+                cursor: grab;
+                touch-action: none;
+                user-select: none;
+                -webkit-user-select: none;
+                transition: opacity 0.12s ease;
+            }
+            .queue-item:hover .queue-drag-handle,
+            .queue-item-dragging .queue-drag-handle {
+                opacity: 1;
+            }
+            .queue-drag-handle:hover {
+                background-image: radial-gradient(circle, rgba(255, 255, 255, 0.95) 1px, transparent 1.4px);
+            }
+            .queue-drag-handle:active { cursor: grabbing; }
             .queue-img {
-                width: 34px;
-                height: 34px;
+                width: 40px;
+                height: 40px;
                 flex-shrink: 0;
                 border-radius: 4px;
                 object-fit: cover;
                 background: #282828;
+            }
+            .queue-source-badge {
+                flex: 0 0 auto;
+                padding: 2px 8px;
+                border-radius: 999px;
+                background: rgba(30, 215, 96, 0.14);
+                color: #1ed760;
+                font-size: 10px;
+                font-weight: 700;
+                line-height: 1.3;
+                white-space: nowrap;
             }
             .queue-text {
                 min-width: 0;
                 flex: 1;
             }
             .queue-name {
-                font-size: 12.5px;
-                font-weight: 600;
+                font-size: 13px;
+                font-weight: 500;
                 color: #ffffff;
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
             }
             .queue-artist {
-                margin-top: 1px;
-                font-size: 11px;
+                margin-top: 2px;
+                font-size: 12px;
                 color: #a7a7a7;
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
+                transition: color 0.12s ease;
             }
             /* Three dots on each row: shown on hover, or while its menu is open */
             .queue-more {
@@ -2161,24 +3724,41 @@
                 position: fixed;
                 z-index: 30;
                 min-width: 160px;
+                max-height: calc(100vh - 16px);
+                overflow-y: auto;
+                overscroll-behavior: contain;
+                scrollbar-width: thin;
+                scrollbar-color: rgba(255, 255, 255, 0.28) transparent;
                 padding: 4px;
                 border-radius: 6px;
                 background: #282828;
                 box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.08);
                 -webkit-app-region: no-drag !important;
             }
+            .queue-menu::-webkit-scrollbar { width: 8px; }
+            .queue-menu::-webkit-scrollbar-button { display: none !important; }
+            .queue-menu::-webkit-scrollbar-track { background: transparent; }
+            .queue-menu::-webkit-scrollbar-thumb {
+                min-height: 32px;
+                background-color: rgba(255, 255, 255, 0.24);
+                border: 2px solid transparent;
+                border-radius: 999px;
+                background-clip: padding-box;
+            }
+            .queue-menu:hover::-webkit-scrollbar-thumb { background-color: rgba(255, 255, 255, 0.4); }
+            .queue-menu::-webkit-scrollbar-thumb:hover { background-color: rgba(255, 255, 255, 0.56); }
             .queue-menu * {
                 -webkit-app-region: no-drag !important;
             }
             .queue-menu-item {
                 display: block;
                 width: 100%;
-                padding: 8px 10px;
+                padding: 9px 12px;
                 border: none;
                 border-radius: 3px;
                 background: transparent;
                 color: #e6e6e6;
-                font-size: 12px;
+                font-size: 13px;
                 font-weight: 500;
                 text-align: left;
                 white-space: nowrap;
@@ -2187,16 +3767,29 @@
                 background: rgba(255, 255, 255, 0.1);
                 color: #ffffff;
             }
+            .queue-menu-item:disabled {
+                opacity: 0.48;
+                cursor: default;
+            }
             .queue-menu-sep {
                 height: 1px;
                 margin: 4px 6px;
                 background: rgba(255, 255, 255, 0.1);
             }
             .queue-empty {
-                padding: 28px 14px;
+                padding: 36px 16px;
                 text-align: center;
-                font-size: 12px;
+                font-size: 13px;
+                font-weight: 700;
+                color: #ffffff;
+            }
+            .queue-empty::after {
+                content: "Songs you add will show up here";
+                display: block;
+                margin-top: 4px;
                 color: #a7a7a7;
+                font-size: 11px;
+                font-weight: 400;
             }
             .upcoming-label {
                 display: inline-flex;
@@ -3002,10 +4595,6 @@
             body.mini-mode .track-artist-inline .artist-link.linkable:hover {
                 color: #ffffff;
             }
-            body.mini-mode .queue-header {
-                display: flex;
-                padding: 6px 12px 2px;
-            }
             body.mini-mode .queue-list {
                 padding-bottom: 0;
             }
@@ -3307,10 +4896,30 @@
             <!-- Queue list overlays the player window from the top bar's queue button -->
             <div class="queue-panel" id="queue-panel">
                 <div class="queue-header">
-                    <span>Next up:</span>
-                    <span class="queue-count" id="queue-count"></span>
+                    <div class="queue-heading">
+                        <span class="queue-title">Queue</span>
+                        <span class="queue-count" id="queue-count" aria-live="polite">0</span>
+                    </div>
+                    <div class="queue-selection-toolbar" id="queue-selection-toolbar">
+                        <button id="queue-select-items" type="button">Select</button>
+                        <span class="queue-selection-count" id="queue-selection-count" aria-live="polite" hidden></span>
+                        <button id="queue-remove-selected" type="button" hidden disabled>Remove</button>
+                        <button id="queue-confirm-remove" type="button" hidden>Confirm</button>
+                        <button id="queue-keep-selection" type="button" hidden>Keep</button>
+                        <button id="queue-cancel-selection" type="button" hidden>Cancel</button>
+                    </div>
                 </div>
-                <div class="queue-list" id="queue-list"></div>
+                <div class="queue-now-playing" id="queue-now-playing" role="status" hidden>
+                    <img class="queue-img queue-now-playing-image" alt="" draggable="false">
+                    <div class="queue-text">
+                        <div class="queue-now-label">Now playing</div>
+                        <div class="queue-name queue-now-playing-title"></div>
+                        <div class="queue-artist queue-now-playing-artist"></div>
+                    </div>
+                    <span class="queue-playing-bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+                </div>
+                <div class="queue-list" id="queue-list" role="list" aria-label="Queue"></div>
+                <div class="queue-source-note" id="queue-source-note"></div>
             </div>
             <!-- Top bar: queue button always; next-song text is optional -->
             <div class="upcoming-bar" id="upcoming-bar">
@@ -3467,6 +5076,9 @@
             if (changedKeys.has("currentTrack") || changedKeys.has("duration")) {
                 renderFullUI();
             }
+            if (changedKeys.has("currentTrack") || changedKeys.has("isPlaying")) {
+                updateNowPlayingRow(doc);
+            }
             if (changedKeys.has("isPlaying")) {
                 updatePlayPauseButton();
                 if (state.isPlaying) startProgressLoop();
@@ -3599,10 +5211,24 @@
         // Queue button in the top bar: show/hide the queue list.
         const queueButton = doc.getElementById("btn-queue");
         listenPiP(queueButton, "click", () => {
+            if (queueBulkRemoving) return;
             queueOpen = !queueOpen;
+            if (!queueOpen) {
+                queueSelectionMode = false;
+                queueSelectedItems.clear();
+                queueBulkConfirm = false;
+            }
             applyQueueLayout();
             if (queueOpen) safeSetTimeout(() => syncPlayerState(["queue"]), 50);
         });
+        listenPiP(doc.getElementById("queue-select-items"), "click", beginQueueSelectionMode);
+        listenPiP(doc.getElementById("queue-remove-selected"), "click", requestBulkQueueRemoval);
+        listenPiP(doc.getElementById("queue-confirm-remove"), "click", removeSelectedQueueItems);
+        listenPiP(doc.getElementById("queue-keep-selection"), "click", () => {
+            queueBulkConfirm = false;
+            updateQueueSelectionToolbar(doc);
+        });
+        listenPiP(doc.getElementById("queue-cancel-selection"), "click", endQueueSelectionMode);
         listenPiP(queueButton, "keydown", (e) => {
             if (e.code === "Space" || e.key === " ") e.preventDefault();
         });
@@ -3614,7 +5240,21 @@
             e.stopPropagation();
         });
         const scrollQueueFromWheel = (e) => {
-            if (!queueOpen || e.deltaY === 0) return;
+            if (e.deltaY === 0) return;
+            const menu = queueMenuEl && queueMenuEl.contains(e.target) ? queueMenuEl : null;
+            if (menu) {
+                const lineHeight = parseFloat(pipWindow.getComputedStyle(menu).lineHeight) || 16;
+                const delta = e.deltaMode === WheelEvent.DOM_DELTA_LINE
+                    ? e.deltaY * lineHeight
+                    : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
+                        ? e.deltaY * menu.clientHeight
+                        : e.deltaY;
+                menu.scrollTop += delta;
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+            if (!queueOpen) return;
             const list = doc.getElementById("queue-list");
             if (!list) return;
 
@@ -4735,7 +6375,7 @@
 
     // Register UI Buttons inside Spotify Client
     function registerButtons() {
-        // 1. Topbar Button: opens the mini player's settings (the playbar button / Alt+M toggle the player)
+        // 1. Topbar Button: opens the mini player's settings (the configured shortcut toggles the player)
         if (Spicetify.Topbar?.Button) {
             try {
                 new Spicetify.Topbar.Button(
@@ -4758,7 +6398,8 @@
                 const btn = document.createElement("button");
                 btn.id = "miniplayer-playbar-btn";
                 btn.className = "main-genericButton-button";
-                btn.setAttribute("aria-label", "Mini Player (Alt+M)");
+                const shortcutLabel = `Mini Player (${formatToggleShortcut()})`;
+                btn.setAttribute("aria-label", shortcutLabel);
                 btn.style.background = "transparent";
                 btn.style.border = "none";
                 btn.style.color = isPiPWindowOpen() ? "#1db954" : "#b3b3b3";
@@ -4771,11 +6412,11 @@
 
                 if (Spicetify.Tippy && Spicetify.TippyProps) {
                     Spicetify.Tippy(btn, {
-                        content: "Mini Player (Alt+M)",
+                        content: shortcutLabel,
                         ...Spicetify.TippyProps
                     });
                 } else {
-                    btn.title = "Mini Player (Alt+M)";
+                    btn.title = shortcutLabel;
                 }
 
                 btn.onmouseenter = () => btn.style.color = "#ffffff";
@@ -4900,17 +6541,16 @@
             console.warn("[MiniPlayer] Could not set up the native button takeover:", e);
         }
 
-        // 3. Global Shortcut within Spotify (Alt + M)
+        // 3. Global mini player shortcut within Spotify
         window.addEventListener("keydown", (e) => {
-            if (e.altKey && (e.key === "m" || e.key === "M")) {
-                const target = /** @type {HTMLElement} */ (e.target);
-                const tag = target?.tagName?.toLowerCase();
-                const isEditable = target?.isContentEditable || tag === "input" || tag === "textarea" || tag === "select";
-                if (isEditable) return;
+            if (e.repeat || e.isComposing || !shortcutMatchesEvent(e)) return;
+            const target = /** @type {HTMLElement} */ (e.target);
+            const tag = target?.tagName?.toLowerCase();
+            const isEditable = target?.isContentEditable || tag === "input" || tag === "textarea" || tag === "select";
+            if (isEditable) return;
 
-                e.preventDefault();
-                toggleMiniPlayer();
-            }
+            e.preventDefault();
+            toggleMiniPlayer();
         });
     }
 
