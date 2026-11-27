@@ -63,12 +63,16 @@
         repeat: 0,
         queue: []
     };
+    let lastAudibleVolume = 1;
     const playerStateListeners = new Set();
     const PLAYER_STATE_SYNC_MS = 2500;
+    const SHUFFLE_STATE_SETTLE_MS = 1600;
     const QUEUE_STATE_SYNC_MS = 1500;
     const QUEUE_SNAPSHOT_WARNING_THRESHOLD = 100;
     const WINDOW_POSITION_SYNC_MS = 2500;
     const EPISODE_VIDEO_SYNC_MS = 500;
+    let shuffleSyncPending = false;
+    let shuffleSyncTimer = null;
     const LYRICS_TEXT_MODES = ["original", "romanized", "both"];
     const LYRICS_TEXT_MODE_LABELS = {
         original: "Original",
@@ -412,8 +416,186 @@
     // Links: current track's album URI (artist URIs live on the rendered artist names)
     let currentAlbumUri = "";
 
+    // Theme presets define the shared palette used throughout the player.
+    const THEMES = {
+        spotify:  { label: "Spotify", bg: "#121212", surface: "#282828", text: "#ffffff", subdued: "#b3b3b3", muted: "#7a7a7a", border: "#727272", accent: "#1ed760", accentStrong: "#1db954", fg: "255, 255, 255", onText: "#000000" },
+        midnight: { label: "Midnight", bg: "#0b1020", surface: "#1a2238", text: "#eef2ff", subdued: "#a3aed0", muted: "#6c7799", border: "#4a5578", accent: "#7c9cff", fg: "255, 255, 255", onText: "#000000" },
+        ocean:    { label: "Ocean", bg: "#06141a", surface: "#12303b", text: "#e8f7fb", subdued: "#9cc3cf", muted: "#668a96", border: "#3f6574", accent: "#38bdf8", fg: "255, 255, 255", onText: "#000000" },
+        sunset:   { label: "Sunset", bg: "#1a0f0c", surface: "#34201a", text: "#fff3ec", subdued: "#d1ada0", muted: "#8e6e63", border: "#6e4f45", accent: "#ff7a59", fg: "255, 255, 255", onText: "#000000" },
+        rose:     { label: "Rose", bg: "#1a0e14", surface: "#33202a", text: "#fff0f6", subdued: "#d1a8bb", muted: "#8e6a7b", border: "#6e4a5b", accent: "#ff5d9e", fg: "255, 255, 255", onText: "#000000" },
+        mono:     { label: "Mono", bg: "#0a0a0a", surface: "#1f1f1f", text: "#ffffff", subdued: "#a3a3a3", muted: "#737373", border: "#525252", accent: "#ffffff", fg: "255, 255, 255", onText: "#000000" }
+    };
+    const PLAYER_STYLES = { classic: "Classic" };
+    const KNOWN_PLAYER_STYLE_IDS = new Set(["classic", "aero", "artwork"]);
+    const installedPlayerStyles = new Map();
+    const playerStyleRegistry = Spicetify.MiniPlayerThemes || (Spicetify.MiniPlayerThemes = { pending: [] });
+    let styleAccent = "";
+    let currentPlayerStyleId = "classic";
+    const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+
+    function hexToRgb(hex) {
+        const n = parseInt(hex.slice(1), 16);
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    }
+
+    function rgbToHex(rgb) {
+        return "#" + rgb.map(value => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0")).join("");
+    }
+
+    function mixHex(a, b, amount) {
+        const A = hexToRgb(a);
+        const B = hexToRgb(b);
+        return rgbToHex(A.map((value, index) => value + (B[index] - value) * amount));
+    }
+
+    function luminance(hex) {
+        const [r, g, b] = hexToRgb(hex).map(value => {
+            const channel = value / 255;
+            return channel <= 0.03928 ? channel / 12.92 : Math.pow((channel + 0.055) / 1.055, 2.4);
+        });
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+
+    function getActivePlayerStyleId() {
+        return installedPlayerStyles.has(settings.style) ? settings.style : "classic";
+    }
+
+    function getActivePlayerStyle() {
+        return installedPlayerStyles.get(getActivePlayerStyleId()) || null;
+    }
+
+    function injectPlayerStyle(doc, playerStyle) {
+        if (!doc || !playerStyle || !playerStyle.css) return;
+        const styleId = `miniplayer-style-${playerStyle.id}`;
+        let element = doc.getElementById(styleId);
+        if (!element) {
+            element = doc.createElement("style");
+            element.id = styleId;
+            doc.head.appendChild(element);
+        }
+        element.textContent = themeCss(playerStyle.css);
+    }
+
+    function setPlayerStyleAccent(styleId, accent) {
+        if (getActivePlayerStyleId() !== styleId) return;
+        styleAccent = typeof accent === "string" && HEX_COLOR.test(accent) ? accent.toLowerCase() : "";
+        if (isPiPWindowOpen()) applyThemeVars(pipWindow.document.documentElement);
+        const input = document.getElementById("mp-custom-accent");
+        if (input) input.value = resolveTheme()["--mp-accent"];
+    }
+
+    function updatePlayerStyleForTrack(coverUrl) {
+        const styleId = getActivePlayerStyleId();
+        if (styleId !== currentPlayerStyleId) {
+            currentPlayerStyleId = styleId;
+            styleAccent = "";
+        }
+        const playerStyle = installedPlayerStyles.get(styleId);
+        if (playerStyle && typeof playerStyle.onTrackChange === "function") {
+            playerStyle.onTrackChange({
+                coverUrl,
+                setAccent: accent => setPlayerStyleAccent(styleId, accent)
+            });
+        }
+    }
+
+    function registerPlayerStyle(definition) {
+        if (!definition || typeof definition !== "object"
+            || typeof definition.id !== "string"
+            || !/^[a-z][a-z0-9-]*$/.test(definition.id)
+            || definition.id === "classic"
+            || typeof definition.label !== "string"
+            || !definition.label.trim()
+            || typeof definition.css !== "string") {
+            console.warn("[MiniPlayer] Ignored an invalid player style registration.");
+            return false;
+        }
+        const playerStyle = {
+            id: definition.id,
+            label: definition.label.trim(),
+            className: `style-${definition.id}`,
+            css: definition.css,
+            accentFromArtwork: definition.accentFromArtwork === true,
+            usesArtworkBackground: definition.usesArtworkBackground === true,
+            artworkBackgroundBlurScale: Number.isFinite(definition.artworkBackgroundBlurScale)
+                ? Math.max(0, definition.artworkBackgroundBlurScale)
+                : 0,
+            onTrackChange: typeof definition.onTrackChange === "function" ? definition.onTrackChange : null
+        };
+        installedPlayerStyles.set(playerStyle.id, playerStyle);
+        PLAYER_STYLES[playerStyle.id] = playerStyle.label;
+        if (isPiPWindowOpen()) {
+            injectPlayerStyle(pipWindow.document, playerStyle);
+            if (settings.style === playerStyle.id) {
+                applySettings();
+                updatePlayerStyleForTrack(getTrackMetadata().cover || "");
+            }
+        }
+        return true;
+    }
+
+    function resolveTheme() {
+        const base = THEMES[settings.theme] || THEMES.spotify;
+        const overridden = HEX_COLOR.test(settings.accentOverride);
+        const playerStyle = getActivePlayerStyle();
+        const artworkAccent = !!playerStyle?.accentFromArtwork && HEX_COLOR.test(styleAccent);
+        const background = HEX_COLOR.test(settings.backgroundOverride)
+            ? settings.backgroundOverride.toLowerCase()
+            : base.bg;
+        const accent = (artworkAccent ? styleAccent : overridden ? settings.accentOverride : base.accent).toLowerCase();
+        return {
+            "--mp-bg": background,
+            "--mp-bg-rgb": hexToRgb(background).join(", "),
+            "--mp-surface": base.surface,
+            "--mp-text": base.text,
+            "--mp-text-soft": mixHex(base.text, background, 0.1),
+            "--mp-text-subdued": base.subdued,
+            "--mp-text-dim": mixHex(base.subdued, background, 0.08),
+            "--mp-text-muted": base.muted,
+            "--mp-border-strong": base.border,
+            "--mp-fg-rgb": base.fg,
+            "--mp-on-text": base.onText,
+            "--mp-accent": accent,
+            "--mp-accent-rgb": hexToRgb(accent).join(", "),
+            "--mp-accent-hover": mixHex(accent, "#ffffff", 0.14),
+            "--mp-accent-strong": !overridden && !artworkAccent && base.accentStrong
+                ? base.accentStrong
+                : mixHex(accent, "#000000", 0.07),
+            "--mp-on-accent": luminance(accent) > 0.179 ? "#000000" : "#ffffff"
+        };
+    }
+
+    function themeVarsCss(tokens = resolveTheme()) {
+        return `:root { ${Object.entries(tokens).map(([name, value]) => `${name}: ${value};`).join(" ")} }`;
+    }
+
+    function applyThemeVars(element, tokens = resolveTheme()) {
+        if (!element) return;
+        for (const [name, value] of Object.entries(tokens)) element.style.setProperty(name, value);
+    }
+
+    function themeCss(css) {
+        return css
+            .replace(/#1ed760\b/gi, "var(--mp-accent)")
+            .replace(/#1db954\b/gi, "var(--mp-accent-strong)")
+            .replace(/#3be477\b/gi, "var(--mp-accent-hover)")
+            .replace(/rgba\(\s*30\s*,\s*215\s*,\s*96\s*,/g, "rgba(var(--mp-accent-rgb),")
+            .replace(/rgba\(\s*255\s*,\s*255\s*,\s*255\s*,/g, "rgba(var(--mp-fg-rgb),")
+            .replace(/rgba\(\s*18\s*,\s*18\s*,\s*18\s*,/g, "rgba(var(--mp-bg-rgb),")
+            .replace(/(?<![\w-])(color\s*:\s*)#000(?:000)?(?![0-9a-f])/gi, "$1var(--mp-on-text)")
+            .replace(/#(?:ffffff|fff)(?![0-9a-f])/gi, "var(--mp-text)")
+            .replace(/#e6e6e6\b|#f2f2f2\b/gi, "var(--mp-text-soft)")
+            .replace(/#b3b3b3\b/gi, "var(--mp-text-subdued)")
+            .replace(/#a7a7a7\b/gi, "var(--mp-text-dim)")
+            .replace(/#7a7a7a\b/gi, "var(--mp-text-muted)")
+            .replace(/#727272\b/gi, "var(--mp-border-strong)")
+            .replace(/#121212\b/gi, "var(--mp-bg)")
+            .replace(/#282828\b/gi, "var(--mp-surface)");
+    }
+
     // ---------- Settings (edited from the topbar gear button) ----------
     const SETTINGS_KEY = "spicetify_miniplayer_settings";
+    const CUSTOM_BACKGROUND_KEY = "spicetify_miniplayer_custom_background";
     const DEFAULT_SETTINGS = {
         autoFade: true,          // dim the window when the mouse isn't over it
         idleOpacity: 0.35,       // how visible the content stays while faded (Document PiP windows can't be truly see-through)
@@ -423,10 +605,16 @@
         seekStep: 5,             // seconds per scroll notch
         volumeStep: 5,           // percent per scroll notch
         toggleShortcut: { code: "KeyM", key: "M", altKey: true, ctrlKey: false, shiftKey: false, metaKey: false },
+        albumArtGradient: true,
+        artworkBackgroundBlur: 35, // percentage of the maximum artwork-background blur
         clickToOpen: true,       // click title/artist to open album/artist page
         dynamicResize: false,    // experimental: free window resizing, the layout adapts to the size
         showUpcoming: true,      // Show the next playback-queue item in the top bar
         replaceNative: true,     // Spotify's own mini player button opens this player instead
+        theme: "spotify",
+        style: "classic",
+        backgroundOverride: "",
+        accentOverride: "",
         modes: { standard: true, compact: true, mini: true }  // which modes you can switch between
     };
 
@@ -498,8 +686,14 @@
         s.idleDelay = clampNum(s.idleDelay, 200, 5000, DEFAULT_SETTINGS.idleDelay);
         s.seekStep = clampNum(s.seekStep, 1, 30, DEFAULT_SETTINGS.seekStep);
         s.volumeStep = clampNum(s.volumeStep, 1, 20, DEFAULT_SETTINGS.volumeStep);
+        s.artworkBackgroundBlur = clampNum(s.artworkBackgroundBlur, 0, 100, DEFAULT_SETTINGS.artworkBackgroundBlur);
+        if (!Object.prototype.hasOwnProperty.call(THEMES, s.theme)) s.theme = DEFAULT_SETTINGS.theme;
+        if (s.style === "minimal") s.style = "aero";
+        if (!KNOWN_PLAYER_STYLE_IDS.has(s.style)) s.style = DEFAULT_SETTINGS.style;
+        if (typeof s.backgroundOverride !== "string" || !HEX_COLOR.test(s.backgroundOverride)) s.backgroundOverride = "";
+        if (typeof s.accentOverride !== "string" || !HEX_COLOR.test(s.accentOverride)) s.accentOverride = "";
         s.toggleShortcut = normalizeToggleShortcut(s.toggleShortcut);
-        ["autoFade", "rememberPosition", "scrollAdjust", "clickToOpen", "showUpcoming", "replaceNative", "dynamicResize"].forEach(k => { s[k] = !!s[k]; });
+        ["autoFade", "rememberPosition", "scrollAdjust", "clickToOpen", "showUpcoming", "replaceNative", "dynamicResize", "albumArtGradient"].forEach(k => { s[k] = !!s[k]; });
         const savedModes = (saved && typeof saved.modes === "object" && saved.modes) || {};
         s.modes = {
             standard: savedModes.standard !== false,
@@ -513,6 +707,57 @@
     }
 
     let settings = loadSettings();
+    playerStyleRegistry.register = registerPlayerStyle;
+    const pendingPlayerStyles = Array.isArray(playerStyleRegistry.pending) ? playerStyleRegistry.pending.splice(0) : [];
+    pendingPlayerStyles.forEach(registerPlayerStyle);
+
+    function loadCustomBackground() {
+        try {
+            const image = localStorage.getItem(CUSTOM_BACKGROUND_KEY) || "";
+            return image.length <= 3800000 && /^data:image\/(?:webp|png|jpeg);base64,/i.test(image) ? image : "";
+        } catch (err) {
+            console.warn("[MiniPlayer] Could not load the custom background:", err);
+            return "";
+        }
+    }
+
+    let customBackgroundData = loadCustomBackground();
+
+    async function encodeCustomBackground(file) {
+        if (!file || !file.type.startsWith("image/")) {
+            throw new Error("Choose a supported image file.");
+        }
+        const url = URL.createObjectURL(file);
+        try {
+            const image = new Image();
+            image.src = url;
+            await image.decode();
+            if (!image.naturalWidth || !image.naturalHeight) {
+                throw new Error("The selected image could not be decoded.");
+            }
+            const scale = Math.min(1, 1280 / Math.max(image.naturalWidth, image.naturalHeight));
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+            canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+            const context = canvas.getContext("2d");
+            if (!context) throw new Error("The image could not be prepared.");
+            context.drawImage(image, 0, 0, canvas.width, canvas.height);
+            const blob = await new Promise((resolve, reject) => {
+                canvas.toBlob(result => result ? resolve(result) : reject(new Error("The image could not be compressed.")), "image/webp", 0.82);
+            });
+            if (blob.size > 2800000) {
+                throw new Error("That image is too large to save. Choose a smaller image.");
+            }
+            return await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error("The compressed image could not be read."));
+                reader.readAsDataURL(blob);
+            });
+        } finally {
+            URL.revokeObjectURL(url);
+        }
+    }
 
     function saveSettings() {
         try {
@@ -604,13 +849,15 @@
         prev: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M3.3 1a.7.7 0 0 1 .7.7v5.15l9.95-5.744a.7.7 0 0 1 1.05.606v12.576a.7.7 0 0 1-1.05.607L4 9.149V14.3a.7.7 0 0 1-.7.7H1.7a.7.7 0 0 1-.7-.7V1.7a.7.7 0 0 1 .7-.7h1.6z"/></svg>`,
         next: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M12.7 1a.7.7 0 0 0-.7.7v5.15L2.05 1.106A.7.7 0 0 0 1 1.712v12.576a.7.7 0 0 0 1.05.607L12 9.149V14.3a.7.7 0 0 0 .7.7h1.6a.7.7 0 0 0 .7-.7V1.7a.7.7 0 0 0-.7-.7h-1.6z"/></svg>`,
         shuffle: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.151.922a.75.75 0 1 0-1.06 1.06L13.109 3H11.16a3.75 3.75 0 0 0-2.873 1.34l-6.173 7.356A2.25 2.25 0 0 1 .39 12.5H0V14h.391a3.75 3.75 0 0 0 2.873-1.34l6.173-7.356a2.25 2.25 0 0 1 1.724-.804h1.947l-1.017 1.018a.75.75 0 0 0 1.06 1.06L15.98 3.75 13.15.922zM.391 3.5H0V2h.391c.9 0 1.745.405 2.308 1.077l1.724 2.056-.99.832L1.936 4.195A2.25 2.25 0 0 0 .39 3.5zm12.76 7.422a.75.75 0 0 1 1.06 1.06L11.39 14.805a.75.75 0 0 1-1.06-1.06l1.439-1.439h-1.61a3.75 3.75 0 0 1-2.872-1.34l-1.724-2.056.99-.832 1.498 1.787a2.25 2.25 0 0 0 1.724.805h1.948l-1.439-1.44z"/></svg>`,
-        repeat: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 4.75A3.75 3.75 0 0 1 3.75 1h8.5A3.75 3.75 0 0 1 16 4.75v5a3.75 3.75 0 0 1-3.75 3.75H9.81l1.018 1.018a.75.75 0 1 1-1.06 1.06L6.939 12.75l2.829-2.828a.75.75 0 1 1 1.06 1.06L9.811 12h2.439a2.25 2.25 0 0 0 2.25-2.25v-5a2.25 2.25 0 0 0-2.25-2.25h-8.5A2.25 2.25 0 0 0 1.5 4.75v5A2.25 2.25 0 0 0 3.75 12H5v1.5H3.75A3.75 3.75 0 0 1 0 9.75v-5z"/></svg>`,
+        repeat: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>`,
+        repeatOne: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/></svg>`,
         volumeHigh: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/></svg>`,
         volumeMedium: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/></svg>`,
         volumeMute: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.7.7 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.7.7 0 0 0 11 19.298z"/><path d="m16.5 14.5 5-5"/><path d="m16.5 9.5 5 5"/></svg>`,
         compact: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M1.5 1h13A1.5 1.5 0 0 1 16 2.5v11a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 13.5v-11A1.5 1.5 0 0 1 1.5 1zm0 1.5a.5.5 0 0 0-.5.5v2h14V3a.5.5 0 0 0-.5-.5h-13zM15 6H1v7.5a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5V6z"/></svg>`,
         expand: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M2.5 1A1.5 1.5 0 0 0 1 2.5v11A1.5 1.5 0 0 0 2.5 15h11a1.5 1.5 0 0 0 1.5-1.5v-11A1.5 1.5 0 0 0 13.5 1h-11zm0 1.5h11a.5.5 0 0 1 .5.5v11a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5z"/></svg>`,
         close: `<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8 2.146 2.854z"/></svg>`,
+        maximize2: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="m21 3-7 7"/><path d="m3 21 7-7"/><path d="M9 21H3v-6"/></svg>`,
         lyrics: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m11 7.601-5.994 8.19a1 1 0 0 0 .1 1.298l.817.818a1 1 0 0 0 1.314.087L15.09 12"/><path d="M16.5 21.174C15.5 20.5 14.372 20 13 20c-2.058 0-3.928 2.356-6 2-2.072-.356-2.775-3.369-1.5-4.5"/><circle cx="16" cy="7" r="5"/></svg>`
     };
 
@@ -623,8 +870,24 @@
         updatePlaybarShortcutLabel();
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
+        const playerStyle = getActivePlayerStyle();
+        applyThemeVars(doc.documentElement);
         doc.documentElement.style.setProperty("--idle-opacity", String(settings.idleOpacity));
+        doc.documentElement.style.setProperty(
+            "--artwork-background-blur",
+            `${settings.artworkBackgroundBlur * (playerStyle?.artworkBackgroundBlurScale || 0)}px`
+        );
         doc.body.classList.toggle("links-off", !settings.clickToOpen);
+        doc.body.classList.toggle("album-art-gradient-off", !settings.albumArtGradient);
+        doc.body.classList.toggle("custom-background", !!customBackgroundData);
+        const customBackground = doc.getElementById("custom-bg");
+        if (customBackground) {
+            customBackground.style.backgroundImage = customBackgroundData ? `url("${customBackgroundData}")` : "none";
+        }
+        const activeStyleId = getActivePlayerStyleId();
+        installedPlayerStyles.forEach(style => {
+            doc.body.classList.toggle(style.className, style.id === activeStyleId);
+        });
         if (!settings.autoFade) doc.body.classList.remove("idle");
         const wasFluid = doc.body.classList.contains("fluid");
         doc.body.classList.toggle("fluid", !!settings.dynamicResize);
@@ -633,6 +896,7 @@
         refreshModeUi();
         lastUpcomingKey = null; // lets the "Show next song" setting apply instantly
         updateUpcomingBar();
+        updatePlayerStyleForTrack(getTrackMetadata().cover || "");
     }
 
     function updatePlaybarShortcutLabel() {
@@ -776,6 +1040,8 @@
             .mp-inline { display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
             .mp-shortcut-control { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
             .mp-shortcut-status { max-width: 180px; color: #a7a7a7; font-size: 10px; line-height: 1.3; text-align: right; }
+            .mp-background-control { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+            .mp-background-status { max-width: 150px; color: #a7a7a7; font-size: 10px; line-height: 1.3; text-align: right; }
             /* Pill buttons, Spotify style: outlined secondary, solid white primary */
             .mp-btn { font: inherit; font-size: 13px; font-weight: 700; padding: 9px 22px; border-radius: 999px; border: 1px solid #727272; background: transparent; color: #fff; cursor: pointer; transition: border-color 0.15s ease, transform 0.1s ease; }
             .mp-btn:hover { border-color: #fff; transform: scale(1.04); }
@@ -791,6 +1057,32 @@
             .mp-chip:hover { background: #3a3a3a; }
             .mp-chip.on { background: #1ed760; color: #000; font-weight: 700; }
             .mp-chip.on:hover { background: #3be477; }
+            .mp-row.stack { flex-direction: column; align-items: stretch; gap: 12px; }
+            .mp-themes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+            .mp-theme { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 8px; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; transition: transform 0.1s ease, box-shadow 0.12s ease, border-color 0.12s ease; }
+            .mp-theme:hover { transform: scale(1.03); border-color: rgba(255, 255, 255, 0.4); }
+            .mp-theme.on { border-color: transparent; box-shadow: 0 0 0 2px #1ed760; }
+            .mp-theme-dot { flex: 0 0 12px; width: 12px; height: 12px; border-radius: 50%; }
+            .mp-styles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+            .mp-style { display: flex; min-width: 0; flex-direction: column; align-items: stretch; gap: 8px; padding: 8px; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 8px; background: #181818; color: #fff; font: inherit; font-size: 11px; font-weight: 700; text-align: left; cursor: pointer; transition: border-color 0.12s ease, background 0.12s ease; }
+            .mp-style:hover { border-color: rgba(255, 255, 255, 0.42); background: #222; }
+            .mp-style.on { border-color: #1ed760; }
+            .mp-style-preview { display: flex; height: 42px; align-items: center; gap: 6px; overflow: hidden; padding: 5px; background: #252525; }
+            .mp-style-preview-art { flex: 0 0 22px; width: 22px; height: 22px; border-radius: 3px; background: linear-gradient(135deg, #6b706b, #b5b6a6); }
+            .mp-style-preview-lines { display: flex; flex: 1; flex-direction: column; gap: 4px; min-width: 0; }
+            .mp-style-preview-lines span { height: 3px; border-radius: 2px; background: rgba(255, 255, 255, 0.78); }
+            .mp-style-preview-lines span:last-child { width: 60%; background: rgba(255, 255, 255, 0.35); }
+            .mp-style-preview-control { flex: 0 0 10px; width: 10px; height: 10px; border-radius: 50%; background: #fff; }
+            .mp-style-preview.aero { height: 42px; border: 1px solid rgba(190, 245, 255, 0.62); border-radius: 11px; background: radial-gradient(ellipse at 18% 0%, rgba(111, 240, 213, 0.62), transparent 58%), linear-gradient(145deg, rgba(255, 255, 255, 0.28), rgba(40, 129, 157, 0.48)); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 2px 5px rgba(0, 0, 0, 0.22); }
+            .mp-style-preview.aero .mp-style-preview-art { border-radius: 7px; background: linear-gradient(145deg, #c4f4ce, #52b9cf 55%, #66a8da); box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.7), 0 1px 3px rgba(0, 0, 0, 0.3); }
+            .mp-style-preview.aero .mp-style-preview-control { background: linear-gradient(145deg, #d6ffe6, #72dfd1); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.75), 0 1px 3px rgba(4, 75, 96, 0.55); }
+            .mp-style-preview.artwork { height: 48px; gap: 5px; padding: 4px; }
+            .mp-style-preview.artwork .mp-style-preview-art { flex-basis: 38px; width: 38px; height: 38px; border-radius: 5px; }
+            .mp-color { width: 38px; height: 26px; padding: 0; border: 1px solid rgba(255, 255, 255, 0.3); border-radius: 6px; background: transparent; cursor: pointer; }
+            .mp-color:disabled { opacity: 0.4; cursor: default; }
+            .mp-color::-webkit-color-swatch-wrapper { padding: 2px; }
+            .mp-color::-webkit-color-swatch { border: none; border-radius: 4px; }
+            .mp-btn:disabled { opacity: 0.4; cursor: default; transform: none; }
         `;
         root.appendChild(style);
 
@@ -811,6 +1103,15 @@
         };
         const row = (label, desc, control) => {
             const r = h("div", "mp-row");
+            const left = h("div", "mp-text");
+            left.appendChild(h("div", "mp-label", label));
+            if (desc) left.appendChild(h("div", "mp-desc", desc));
+            r.appendChild(left);
+            r.appendChild(control);
+            group.appendChild(r);
+        };
+        const rowStack = (label, desc, control) => {
+            const r = h("div", "mp-row stack");
             const left = h("div", "mp-text");
             left.appendChild(h("div", "mp-label", label));
             if (desc) left.appendChild(h("div", "mp-desc", desc));
@@ -912,6 +1213,223 @@
             return wrap;
         };
 
+        let syncBackgroundControl = () => {};
+        let syncAccentControl = () => {};
+        let syncArtworkControls = () => {};
+        let albumArtGradientInput = null;
+        let artworkBackgroundBlurInput = null;
+        const stylePicker = () => {
+            const grid = h("div", "mp-styles");
+            const buttons = new Map();
+            Object.entries(PLAYER_STYLES).forEach(([id, label]) => {
+                const button = h("button", "mp-style" + (getActivePlayerStyleId() === id ? " on" : ""));
+                button.type = "button";
+                button.setAttribute("aria-pressed", String(getActivePlayerStyleId() === id));
+                const preview = h("span", `mp-style-preview ${id}`);
+                preview.setAttribute("aria-hidden", "true");
+                preview.appendChild(h("span", "mp-style-preview-art"));
+                const lines = h("span", "mp-style-preview-lines");
+                lines.appendChild(h("span", ""));
+                lines.appendChild(h("span", ""));
+                preview.appendChild(lines);
+                preview.appendChild(h("span", "mp-style-preview-control"));
+                button.appendChild(preview);
+                button.appendChild(h("span", "", label));
+                button.addEventListener("click", () => {
+                    settings.style = id;
+                    saveSettings();
+                    applySettings();
+                    buttons.forEach((element, styleId) => {
+                        const selected = styleId === getActivePlayerStyleId();
+                        element.classList.toggle("on", selected);
+                        element.setAttribute("aria-pressed", String(selected));
+                    });
+                    syncArtworkControls();
+                });
+                buttons.set(id, button);
+                grid.appendChild(button);
+            });
+            return grid;
+        };
+        const themePicker = () => {
+            const grid = h("div", "mp-themes");
+            const tiles = new Map();
+            Object.entries(THEMES).forEach(([id, theme]) => {
+                const tile = h("button", "mp-theme" + (settings.theme === id ? " on" : ""));
+                tile.type = "button";
+                tile.title = theme.label;
+                tile.setAttribute("aria-pressed", String(settings.theme === id));
+                tile.style.background = theme.bg;
+                tile.style.color = theme.text;
+                const dot = h("span", "mp-theme-dot");
+                dot.style.background = theme.accent;
+                dot.setAttribute("aria-hidden", "true");
+                tile.appendChild(dot);
+                tile.appendChild(h("span", "mp-theme-name", theme.label));
+                tile.addEventListener("click", () => {
+                    settings.theme = id;
+                    if (!getActivePlayerStyle()?.accentFromArtwork) settings.accentOverride = "";
+                    saveSettings();
+                    applySettings();
+                    syncBackgroundControl();
+                    tiles.forEach((element, themeId) => {
+                        const selected = themeId === id;
+                        element.classList.toggle("on", selected);
+                        element.setAttribute("aria-pressed", String(selected));
+                    });
+                    syncArtworkControls();
+                });
+                tiles.set(id, tile);
+                grid.appendChild(tile);
+            });
+            return grid;
+        };
+
+        const backgroundControl = () => {
+            const wrap = h("div", "mp-inline");
+            const input = document.createElement("input");
+            input.type = "color";
+            input.className = "mp-color";
+            input.title = "Main player background color";
+            input.setAttribute("aria-label", "Main player background color");
+            const reset = h("button", "mp-btn small", "Reset");
+            reset.type = "button";
+            syncBackgroundControl = () => {
+                input.value = resolveTheme()["--mp-bg"];
+                reset.disabled = !settings.backgroundOverride;
+            };
+            input.addEventListener("input", () => {
+                settings.backgroundOverride = input.value;
+                applySettings();
+                reset.disabled = false;
+            });
+            input.addEventListener("change", saveSettings);
+            reset.addEventListener("click", () => {
+                settings.backgroundOverride = "";
+                saveSettings();
+                applySettings();
+                syncBackgroundControl();
+            });
+            syncBackgroundControl();
+            wrap.appendChild(input);
+            wrap.appendChild(reset);
+            return wrap;
+        };
+
+        const accentControl = () => {
+            const wrap = h("div", "mp-inline");
+            const input = document.createElement("input");
+            input.type = "color";
+            input.className = "mp-color";
+            input.id = "mp-custom-accent";
+            input.title = "Accent color";
+            input.setAttribute("aria-label", "Custom accent color");
+            const reset = h("button", "mp-btn small", "Reset");
+            reset.type = "button";
+            syncAccentControl = () => {
+                input.value = resolveTheme()["--mp-accent"];
+                const artworkStyle = !!getActivePlayerStyle()?.accentFromArtwork;
+                input.disabled = artworkStyle;
+                reset.disabled = artworkStyle || !settings.accentOverride;
+            };
+            input.addEventListener("input", () => {
+                settings.accentOverride = input.value;
+                applySettings();
+                reset.disabled = false;
+            });
+            input.addEventListener("change", saveSettings);
+            reset.addEventListener("click", () => {
+                settings.accentOverride = "";
+                saveSettings();
+                applySettings();
+                syncAccentControl();
+            });
+            syncAccentControl();
+            wrap.appendChild(input);
+            wrap.appendChild(reset);
+            return wrap;
+        };
+
+        const customBackgroundControl = () => {
+            const wrap = h("div", "mp-background-control");
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = "image/*";
+            input.hidden = true;
+            input.setAttribute("aria-label", "Choose a custom player background image");
+            const choose = h("button", "mp-btn small", "Choose image");
+            choose.type = "button";
+            const remove = h("button", "mp-btn small", "Remove");
+            remove.type = "button";
+            remove.disabled = !customBackgroundData;
+            const status = h("span", "mp-background-status", customBackgroundData ? "Custom image applied." : "No image selected.");
+            status.setAttribute("aria-live", "polite");
+            let preparing = false;
+            syncArtworkControls = () => {
+                const artworkStyle = !!getActivePlayerStyle()?.usesArtworkBackground;
+                syncAccentControl();
+                input.disabled = artworkStyle || preparing;
+                choose.disabled = artworkStyle || preparing;
+                remove.disabled = artworkStyle || preparing || !customBackgroundData;
+                if (albumArtGradientInput) albumArtGradientInput.disabled = artworkStyle;
+                if (artworkBackgroundBlurInput) artworkBackgroundBlurInput.disabled = !artworkStyle;
+                status.textContent = artworkStyle
+                    ? customBackgroundData
+                        ? `${getActivePlayerStyle()?.label || "This style"} uses album art. Your saved image is kept for other styles.`
+                        : `${getActivePlayerStyle()?.label || "This style"} uses album art. Custom backgrounds are disabled.`
+                    : customBackgroundData
+                        ? "Custom image applied."
+                        : "No image selected.";
+            };
+
+            choose.addEventListener("click", () => input.click());
+            input.addEventListener("change", async () => {
+                const file = input.files && input.files[0];
+                input.value = "";
+                if (!file) return;
+                preparing = true;
+                choose.disabled = true;
+                status.textContent = "Preparing image…";
+                try {
+                    const data = await encodeCustomBackground(file);
+                    if (typeof data !== "string" || data.length > 3800000) {
+                        throw new Error("That image is too large to save. Choose a smaller image.");
+                    }
+                    localStorage.setItem(CUSTOM_BACKGROUND_KEY, data);
+                    customBackgroundData = data;
+                    applySettings();
+                    syncArtworkControls();
+                } catch (err) {
+                    console.warn("[MiniPlayer] Could not save the custom background:", err);
+                    status.textContent = err.message || "The image could not be saved.";
+                    Spicetify.showNotification(status.textContent, true);
+                } finally {
+                    preparing = false;
+                    const artworkStyle = !!getActivePlayerStyle()?.usesArtworkBackground;
+                    input.disabled = artworkStyle;
+                    choose.disabled = artworkStyle;
+                    remove.disabled = artworkStyle || !customBackgroundData;
+                }
+            });
+            remove.addEventListener("click", () => {
+                try {
+                    localStorage.removeItem(CUSTOM_BACKGROUND_KEY);
+                    customBackgroundData = "";
+                    applySettings();
+                    syncArtworkControls();
+                } catch (err) {
+                    console.warn("[MiniPlayer] Could not remove the custom background:", err);
+                    status.textContent = "Couldn't remove the saved image.";
+                    Spicetify.showNotification(status.textContent, true);
+                }
+            });
+            wrap.appendChild(input);
+            wrap.appendChild(choose);
+            wrap.appendChild(remove);
+            wrap.appendChild(status);
+            return wrap;
+        };
+
         // Chips for choosing which modes are available (at least one must stay on)
         const modeChips = () => {
             const wrap = h("div", "mp-chips");
@@ -985,6 +1503,26 @@
             "Shows the first upcoming track from the playback queue in the top bar.",
             toggle("showUpcoming"));
 
+        section("Appearance");
+        rowStack("Theme", "Choose a color palette for the mini player.", themePicker());
+        rowStack("Player style", "Choose a layout and visual treatment; Skeuomorph adapts to your selected colors.", stylePicker());
+        row("Main color", "Override the theme's main player background.", backgroundControl());
+        row("Accent color", "Set a custom accent. Adaptive favors bright, saturated album-art colors and keeps this color for other styles.", accentControl());
+        const albumArtGradientControl = toggle("albumArtGradient");
+        albumArtGradientInput = albumArtGradientControl.querySelector("input");
+        row("Album art gradient", "Show a blurred album-art glow. Adaptive uses a clear album-art background instead.",
+            albumArtGradientControl);
+        const artworkBackgroundBlurControl = slider(
+            "artworkBackgroundBlur", 0, 100, 5,
+            v => v, v => v, v => `${v}%`
+        );
+        artworkBackgroundBlurInput = artworkBackgroundBlurControl.querySelector("input");
+        row("Adaptive background blur", "Set the album-art background blur. 0% is sharp; 100% is strongest.",
+            artworkBackgroundBlurControl);
+        rowStack("Custom background image", "Custom images appear below the top bar. Adaptive uses current cover art instead.",
+            customBackgroundControl());
+        syncArtworkControls();
+
         section("Experimental");
         row("Dynamic resizing",
             "Resize the window freely and everything inside moves with it: the layout switches between Mini, Compact and Standard, scales up to fit, and shows a large album-art layout when tall. Replaces click-to-switch modes. A shrink button appears in the top bar when the window gets large.",
@@ -1000,6 +1538,13 @@
         const resetAll = h("button", "mp-btn", "Reset to defaults");
         resetAll.addEventListener("click", () => {
             settings = cloneDefaultSettings();
+            try {
+                localStorage.removeItem(CUSTOM_BACKGROUND_KEY);
+                customBackgroundData = "";
+            } catch (err) {
+                console.warn("[MiniPlayer] Could not clear the custom background during reset:", err);
+                Spicetify.showNotification("Couldn't clear the saved background image.", true);
+            }
             saveSettings();
             applySettings();
             Spicetify.PopupModal.hide();
@@ -1297,6 +1842,17 @@
         } catch (err) {
             console.warn("[MiniPlayer] Unable to shrink the window:", err);
             Spicetify.showNotification("Couldn't resize the window", true);
+        }
+    }
+
+    function expandToStandardSize() {
+        if (!isPiPWindowOpen() || !settings.dynamicResize) return;
+        const { width, height } = modeWindowSize("standard");
+        try {
+            pipWindow.resizeTo(width + pipWindowFrameWidth, height + pipWindowFrameHeight);
+        } catch (err) {
+            console.warn("[MiniPlayer] Unable to expand to Standard size:", err);
+            Spicetify.showNotification("Couldn't expand the mini player", true);
         }
     }
 
@@ -2008,6 +2564,9 @@
     function publishPlayerState(patch) {
         const changedKeys = new Set();
         for (const [key, value] of Object.entries(patch)) {
+            if (key === "volume" && Number.isFinite(value) && value > 0) {
+                lastAudibleVolume = Math.min(1, Math.max(0, value));
+            }
             if (!Object.is(playerStateKey(key, playerState[key]), playerStateKey(key, value))) {
                 changedKeys.add(key);
             }
@@ -2062,7 +2621,7 @@
             const volume = Spicetify.Player.getVolume();
             patch.volume = Number.isFinite(volume) ? volume : playerState.volume;
         }
-        if (requested.has("shuffle")) patch.shuffle = !!data.shuffle;
+        if (requested.has("shuffle") && !shuffleSyncPending) patch.shuffle = !!data.shuffle;
         if (requested.has("repeat")) patch.repeat = Number(data.repeat) || 0;
         if (requested.has("queue")) patch.queue = SpotifyAdapter.getQueue(queueOpen ? Infinity : 1);
         const changedKeys = publishPlayerState(patch);
@@ -2074,6 +2633,39 @@
 
     function updatePlayerState(patch) {
         return publishPlayerState(patch);
+    }
+
+    function togglePlayerShuffle() {
+        const nextShuffle = !playerState.shuffle;
+        safeClearTimeout(shuffleSyncTimer);
+        shuffleSyncPending = true;
+        try {
+            Spicetify.Player.toggleShuffle();
+        } catch (error) {
+            shuffleSyncPending = false;
+            syncPlayerState(["shuffle"]);
+            throw error;
+        }
+        updatePlayerState({ shuffle: nextShuffle });
+        shuffleSyncTimer = safeSetTimeout(() => {
+            shuffleSyncTimer = null;
+            shuffleSyncPending = false;
+            syncPlayerState(["shuffle"]);
+        }, SHUFFLE_STATE_SETTLE_MS);
+    }
+
+    function togglePlayerMute() {
+        const reportedVolume = Spicetify.Player.getVolume();
+        const currentVolume = Number.isFinite(reportedVolume) ? reportedVolume : playerState.volume;
+        if (currentVolume > 0) {
+            lastAudibleVolume = Math.min(1, Math.max(0, currentVolume));
+            Spicetify.Player.setVolume(0);
+            updatePlayerState({ volume: 0 });
+            return;
+        }
+        const restoreVolume = lastAudibleVolume > 0 ? lastAudibleVolume : 1;
+        Spicetify.Player.setVolume(restoreVolume);
+        updatePlayerState({ volume: restoreVolume });
     }
 
     function subscribePlayerState(listener) {
@@ -2995,7 +3587,12 @@
             renderedQueueItems = null;
         }
         doc.body.classList.toggle("queue-open", queueOpen);
-        doc.getElementById("btn-queue")?.classList.toggle("active", queueOpen);
+        doc.querySelectorAll(".queue-toggle-btn").forEach(button => {
+            button.classList.toggle("active", queueOpen);
+            button.setAttribute("aria-expanded", String(queueOpen));
+            button.setAttribute("aria-label", queueOpen ? "Hide queue" : "Show queue");
+            button.title = queueOpen ? "Hide Queue" : "Queue";
+        });
         resizePiPWindowToMode();
 
         lastQueueKey = null;
@@ -3045,6 +3642,39 @@
         } catch (err) {}
     }
 
+    // ---------- Guard against Spotify's native mini player ----------
+    // Click interception only catches clicks on Spotify's button. Spotify can also open its own mini
+    // player another way (keyboard shortcut, a re-rendered button, etc). So while "Replace Spotify's
+    // mini player" is on, documentPictureInPicture.requestWindow is wrapped: our own calls pass
+    // straight through, and any other request opens this player instead.
+    let originalRequestWindow = null;
+
+    function requestOwnPiPWindow(options) {
+        const dpip = window.documentPictureInPicture;
+        return (originalRequestWindow || dpip.requestWindow.bind(dpip))(options);
+    }
+
+    function installNativePiPGuard() {
+        try {
+            const dpip = window.documentPictureInPicture;
+            if (!dpip || originalRequestWindow) return;
+            const original = dpip.requestWindow.bind(dpip);
+            originalRequestWindow = original;
+            Object.defineProperty(dpip, "requestWindow", {
+                configurable: true,
+                writable: true,
+                value: function (options) {
+                    if (!settings.replaceNative) return original(options);
+                    // Same task as the user's click, so user activation is still valid for our window
+                    openMiniPlayer();
+                    return Promise.reject(new DOMException("Replaced by the custom mini player", "AbortError"));
+                }
+            });
+        } catch (e) {
+            console.warn("[MiniPlayer] Could not guard Spotify's native mini player:", e);
+        }
+    }
+
     // Opens or brings to focus the Document PiP Window
     async function openMiniPlayer() {
         if (isOpening) return;
@@ -3067,7 +3697,7 @@
 
             // Request floating document PiP window
             // @ts-ignore
-            pipWindow = await window.documentPictureInPicture.requestWindow({
+            pipWindow = await requestOwnPiPWindow({
                 width,
                 height
             });
@@ -3083,8 +3713,9 @@
 
             // Inject Custom Styles
             const style = pipWindow.document.createElement("style");
-            style.textContent = getMiniPlayerStyles();
+            style.textContent = themeVarsCss() + "\n" + themeCss(getMiniPlayerStyles());
             pipWindow.document.head.appendChild(style);
+            installedPlayerStyles.forEach(playerStyle => injectPlayerStyle(pipWindow.document, playerStyle));
 
             // Inject DOM
             pipWindow.document.body.innerHTML = getMiniPlayerHTML();
@@ -3185,15 +3816,52 @@
     // We find Spotify's button by its test id or its exact label. If Spotify renames either (or the
     // label is translated), nothing matches and we simply fall back to our own playbar button.
     const NATIVE_MINIPLAYER_TESTIDS = ["pip-toggle-button", "control-button-pip", "miniplayer-button", "mini-player-button"];
-    const NATIVE_MINIPLAYER_LABELS = ["miniplayer"]; // compared lowercase with spaces/dashes removed
+
+    function normalizeNativeMiniplayerLabel(value) {
+        return (value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    }
 
     function isNativeMiniplayerButton(el) {
         if (!el || el.id === "miniplayer-playbar-btn") return false;
         const testId = (el.getAttribute("data-testid") || "").toLowerCase();
-        if (testId && NATIVE_MINIPLAYER_TESTIDS.includes(testId)) return true;
-        // Exact match only, so our own shortcut label and settings button never count
-        const label = (el.getAttribute("aria-label") || "").toLowerCase().replace(/[\s_-]+/g, "");
-        return !!label && NATIVE_MINIPLAYER_LABELS.includes(label);
+        const normalizedTestId = normalizeNativeMiniplayerLabel(testId);
+        if (NATIVE_MINIPLAYER_TESTIDS.includes(testId)
+            || (normalizedTestId.includes("miniplayer")
+                && !/(?:settings|preferences|shortcut)/.test(normalizedTestId))
+            || normalizedTestId.endsWith("pipbutton")
+            || normalizedTestId.endsWith("piptoggle")
+            || normalizedTestId.endsWith("piptogglebutton")) return true;
+
+        const labels = [
+            el.getAttribute("aria-label"),
+            el.getAttribute("title"),
+            el.getAttribute("data-tooltip")
+        ];
+        return labels.some(value => {
+            const label = normalizeNativeMiniplayerLabel(value);
+            return [
+                "miniplayer",
+                "openminiplayer",
+                "openinminiplayer",
+                "toggleminiplayer",
+                "closeminiplayer",
+                "launchminiplayer",
+                "enableminiplayer",
+                "disableminiplayer",
+                "pictureinpicture",
+                "openpictureinpicture",
+                "openinpictureinpicture",
+                "togglepictureinpicture",
+                "enablepictureinpicture",
+                "disablepictureinpicture",
+                "pip",
+                "openpip",
+                "openinpip",
+                "togglepip",
+                "enablepip",
+                "disablepip"
+            ].includes(label);
+        });
     }
 
     function isOpenMiniplayerButton(el) {
@@ -3205,19 +3873,22 @@
             el.textContent
         ];
         return labels.some(value => {
-            const label = (value || "").toLowerCase().replace(/[^a-z]/g, "");
-            return label === "openinminiplayer" || label === "openinminplayer";
+            const label = normalizeNativeMiniplayerLabel(value);
+            return label === "openinminiplayer"
+                || label === "openinminplayer"
+                || label === "openinpictureinpicture"
+                || label === "openinpip";
         });
     }
 
     function findNativeMiniplayerButtons(scope = null) {
         try {
-            // Never fall back to document: episode pages can contain hundreds of unrelated playback controls.
+            // Prefer the playback bar; strict labels keep the document-level fallback from matching settings.
             const playbackBar = scope || document.querySelector(
                 ".main-nowPlayingBar-container, [data-testid='now-playing-bar'], .main-nowPlayingBar-right, [data-testid='now-playing-bar-right']"
             );
-            if (!playbackBar) return [];
-            return Array.from(playbackBar.querySelectorAll("button[data-testid], button[aria-label], [role='button'][aria-label]"))
+            const searchRoot = playbackBar || document;
+            return Array.from(searchRoot.querySelectorAll("button, [role='button']"))
                 .filter(isNativeMiniplayerButton);
         } catch (e) {
             return [];
@@ -3255,7 +3926,7 @@
             }
             .player-surface {
                 position: relative;
-                z-index: 1;
+                z-index: 2;
                 display: flex;
                 flex: 0 0 100%;
                 flex-direction: column;
@@ -3283,8 +3954,8 @@
                 -webkit-app-region: drag;
                 cursor: grab;
             }
-            /* Queue button, pinned to the right end of the top bar */
-            .queue-btn {
+            /* Top-bar actions, pinned to the right end */
+            .topbar-action-btn {
                 margin-left: auto;
                 flex-shrink: 0;
                 display: inline-flex;
@@ -3299,14 +3970,11 @@
                 color: #b3b3b3;
                 transition: color 0.15s ease, background 0.15s ease;
             }
-            .queue-btn:hover {
+            .topbar-action-btn:hover {
                 color: #ffffff;
                 background: rgba(255, 255, 255, 0.12);
             }
-            .queue-btn.active {
-                color: #1ed760;
-            }
-            /* When "Show next song" is off, the bar only holds the queue button */
+            /* When "Show next song" is off, the bar only holds its controls */
             .upcoming-bar.no-next .upcoming-label,
             .upcoming-bar.no-next .upcoming-text {
                 display: none;
@@ -3339,11 +4007,11 @@
             body.queue-open .queue-panel {
                 display: flex;
             }
-            body.queue-open .miniplayer-card {
-                visibility: hidden;
+            body.queue-open .player-surface .miniplayer-card {
+                display: none;
                 pointer-events: none;
             }
-            /* Header: title + count on the left, "Select" on the right. While selecting, the toolbar takes the row. */
+            /* Header: title + count on the left, queue controls on the right. */
             .queue-header {
                 display: flex;
                 flex: 0 0 auto;
@@ -3380,6 +4048,16 @@
             .queue-header:has(#queue-cancel-selection:not([hidden])) .queue-selection-toolbar {
                 flex: 1 1 auto;
             }
+            .queue-header-actions {
+                display: flex;
+                flex: 0 0 auto;
+                align-items: center;
+                gap: 6px;
+                min-width: 0;
+            }
+            .queue-header:has(#queue-cancel-selection:not([hidden])) .queue-header-actions {
+                flex: 1 1 auto;
+            }
             .queue-selection-toolbar {
                 display: flex;
                 flex: 0 1 auto;
@@ -3387,6 +4065,24 @@
                 justify-content: flex-end;
                 gap: 6px;
                 min-width: 0;
+            }
+            .queue-close-btn {
+                display: inline-flex;
+                flex: 0 0 24px;
+                align-items: center;
+                justify-content: center;
+                width: 24px;
+                height: 24px;
+                padding: 0;
+                border: 0;
+                border-radius: 50%;
+                background: transparent;
+                color: #b3b3b3;
+                cursor: pointer;
+            }
+            .queue-close-btn:hover {
+                color: #ffffff;
+                background: rgba(255, 255, 255, 0.12);
             }
             .queue-selection-toolbar [hidden] {
                 display: none !important;
@@ -3846,10 +4542,31 @@
             body.idle .player-surface {
                 opacity: var(--idle-opacity, 0.35);
             }
+            @media (min-width: 690px) and (min-height: 420px) {
+                body.idle.podcast-video-active .player-surface {
+                    opacity: 1;
+                }
+                body.idle.podcast-video-active #ambient-bg,
+                body.idle.podcast-video-active.custom-background #ambient-bg {
+                    opacity: var(--idle-opacity, 0.35);
+                }
+                body.idle.podcast-video-active #custom-bg {
+                    opacity: calc(0.78 * var(--idle-opacity, 0.35));
+                }
+                body.podcast-video-active .player-surface::before {
+                    transition: opacity 0.35s ease;
+                }
+                body.idle.podcast-video-active .player-surface::before {
+                    opacity: var(--idle-opacity, 0.35);
+                }
+            }
             /* Ghost effect: the content fades hard, but the blurred cover-art backdrop stays visible,
                so the window reads as a faint tinted pane rather than just going dark */
             body.idle #ambient-bg {
                 opacity: max(var(--idle-opacity, 0.35), 0.5);
+            }
+            body.album-art-gradient-off #ambient-bg {
+                display: none;
             }
             /* Ambient dynamic background */
             #ambient-bg {
@@ -3863,6 +4580,22 @@
                 transition: background-image 0.5s ease, opacity 0.35s ease;
                 pointer-events: none;
             }
+            #custom-bg {
+                position: absolute;
+                inset: ${UPCOMING_BAR_HEIGHT}px -18px -18px;
+                left: -18px;
+                z-index: 0;
+                background-size: cover;
+                background-position: center;
+                opacity: 0.78;
+                filter: brightness(0.72) saturate(0.9);
+                clip-path: inset(0);
+                pointer-events: none;
+                transition: background-image 0.5s ease, opacity 0.35s ease, filter 0.35s ease;
+            }
+            body.idle #custom-bg { filter: brightness(0.72) saturate(0.9) blur(18px); }
+            body.custom-background #ambient-bg { opacity: 0.22; }
+            body.idle.custom-background #ambient-bg { opacity: max(var(--idle-opacity, 0.35), 0.5); }
             /* Locked Fixed-Size Card: NEVER expands or stretches when window edges are touched */
             .miniplayer-card {
                 position: relative;
@@ -3940,24 +4673,6 @@
             }
             .icon-btn.active {
                 color: #1db954;
-            }
-            .icon-btn.repeat-one {
-                position: relative;
-            }
-            .icon-btn.repeat-one::after {
-                content: "1";
-                position: absolute;
-                top: 50%;
-                left: 50%;
-                transform: translate(-50%, -50%);
-                padding: 0 1px;
-                border-radius: 2px;
-                background: #121212;
-                color: currentColor;
-                font-size: 7px;
-                font-weight: 700;
-                line-height: 1;
-                pointer-events: none;
             }
             /* Track Section */
             .track-section {
@@ -4297,16 +5012,22 @@
             }
             /* Controls Section (Centered) */
             .controls-section {
-                display: flex;
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+                column-gap: 12px;
                 align-items: center;
-                justify-content: space-between;
                 margin-top: 2px;
             }
             .controls-spacer {
-                width: 65px;
-                flex-shrink: 0;
+                grid-column: 1;
+                min-width: 0;
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
             }
             .playback-controls {
+                grid-column: 2;
+                justify-self: center;
                 display: flex;
                 align-items: center;
                 gap: 12px;
@@ -4333,12 +5054,13 @@
             }
             /* Volume Section */
             .volume-section {
+                grid-column: 3;
+                justify-self: start;
                 display: flex;
                 align-items: center;
                 gap: 6px;
-                width: 65px;
-                flex-shrink: 0;
-                justify-content: flex-end;
+                min-width: 0;
+                justify-content: flex-start;
             }
             .volume-slider {
                 width: 48px;
@@ -4380,7 +5102,7 @@
             body.compact-mode .compact-actions-cluster {
                 display: contents !important;
             }
-            /* Keep the close button at the far right. */
+            /* Keep the queue button at the far right. */
             body.compact-mode .compact-actions-cluster .window-actions {
                 flex-direction: column-reverse;
                 gap: 0;
@@ -4703,12 +5425,17 @@
             body.fluid .play-pause-btn svg { scale: var(--s, 1); }
             body.fluid .play-pause-btn { width: calc(32px * var(--s, 1)); height: calc(32px * var(--s, 1)); }
             body.fluid:not(.compact-mode) .playback-controls { gap: calc(12px * var(--s, 1)); }
+            body.fluid:not(.compact-mode) .controls-section { column-gap: calc(12px * var(--s, 1)); }
+            body.fluid.vol-icon-only:not(.compact-mode) .playback-controls { gap: calc(8px * var(--s, 1)); }
+            body.fluid.vol-icon-only:not(.compact-mode) .controls-section { column-gap: calc(8px * var(--s, 1)); }
+            body.fluid.vol-icon-only:not(.compact-mode) .playback-controls > button,
+            body.fluid.vol-icon-only:not(.compact-mode) .volume-section .icon-btn { flex: 0 0 auto; }
             body.fluid .controls-spacer,
             body.fluid .volume-section { width: auto; }
             body.fluid .volume-section .volume-slider { width: var(--vol-w, calc(48px * var(--s, 1))); }
             body.fluid.vol-icon-only .volume-section .volume-slider { display: none; }
             /* Standard / art: three equal-sided columns keep the transport row exactly centered,
-               whatever the volume section needs; volume sits at the right edge */
+               with the lyrics and volume controls equally spaced on either side */
             body.fluid .controls-section {
                 display: grid;
                 grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
@@ -4716,7 +5443,7 @@
             }
             body.fluid .controls-spacer { grid-column: 1; }
             body.fluid .controls-section .playback-controls { grid-column: 2; justify-self: center; }
-            body.fluid .volume-section { grid-column: 3; justify-self: end; }
+            body.fluid .volume-section { grid-column: 3; justify-self: start; }
             /* Compact, wide enough: cover + title left, controls dead center, close right */
             body.fluid.ctr-controls.compact-mode:not(.mini-mode) .track-section {
                 display: grid;
@@ -4783,9 +5510,34 @@
             /* Shrink button (top bar): only while the window is much bigger than the biggest enabled mode */
             .shrink-btn { display: none; margin-left: auto; }
             body.fluid.can-shrink .shrink-btn { display: inline-flex; }
-            body.fluid.can-shrink .shrink-btn + .queue-btn { margin-left: 0; }
+            body.fluid.can-shrink .shrink-btn + .topbar-action-btn { margin-left: 0; }
             /* Slim (window under 74px tall): the top bar steps aside so the card gets the whole height */
-            body.fluid.slim .upcoming-bar { display: none; }
+            body.fluid.slim .upcoming-bar {
+                display: flex;
+                position: absolute;
+                inset: 0 0 auto auto;
+                flex: 0 0 auto;
+                width: auto;
+                height: ${UPCOMING_BAR_HEIGHT}px;
+                padding: 2px 8px;
+                border: 0;
+                background: transparent;
+                pointer-events: none;
+            }
+            body.fluid.slim .topbar-close-btn { pointer-events: auto; }
+            body.fluid.slim .upcoming-bar > :not(.topbar-close-btn) { display: none; }
+            body.fluid.slim .topbar-close-btn { pointer-events: auto; }
+            .dynamic-mini-expand-btn { display: none !important; }
+            body.fluid.slim.mini-mode .upcoming-bar { display: none; }
+            body.fluid.slim.mini-mode .topbar-close-btn,
+            body.fluid.slim.mini-mode .queue-toggle-btn { display: none !important; }
+            body.fluid.slim.mini-mode .compact-actions-cluster .window-actions .dynamic-mini-expand-btn {
+                display: flex !important;
+                flex: 0 0 calc(24px * var(--s, 1));
+                width: calc(24px * var(--s, 1));
+                height: calc(24px * var(--s, 1));
+            }
+            body.fluid.slim #custom-bg { top: 0; }
             /* Tiny (Mini under 300px wide): shuffle/repeat drop out, padding tightens, volume stays */
             body.fluid.tiny #btn-shuffle-compact,
             body.fluid.tiny #btn-repeat-compact { display: none !important; }
@@ -4891,22 +5643,26 @@
 
     function getMiniPlayerHTML() {
         return `
+            <div id="custom-bg"></div>
             <div id="ambient-bg"></div>
             <div class="player-surface" id="player-surface">
-            <!-- Queue list overlays the player window from the top bar's queue button -->
+            <!-- Queue list overlays the player window from its queue controls -->
             <div class="queue-panel" id="queue-panel">
                 <div class="queue-header">
                     <div class="queue-heading">
                         <span class="queue-title">Queue</span>
                         <span class="queue-count" id="queue-count" aria-live="polite">0</span>
                     </div>
-                    <div class="queue-selection-toolbar" id="queue-selection-toolbar">
-                        <button id="queue-select-items" type="button">Select</button>
-                        <span class="queue-selection-count" id="queue-selection-count" aria-live="polite" hidden></span>
-                        <button id="queue-remove-selected" type="button" hidden disabled>Remove</button>
-                        <button id="queue-confirm-remove" type="button" hidden>Confirm</button>
-                        <button id="queue-keep-selection" type="button" hidden>Keep</button>
-                        <button id="queue-cancel-selection" type="button" hidden>Cancel</button>
+                    <div class="queue-header-actions">
+                        <div class="queue-selection-toolbar" id="queue-selection-toolbar">
+                            <button id="queue-select-items" type="button">Select</button>
+                            <span class="queue-selection-count" id="queue-selection-count" aria-live="polite" hidden></span>
+                            <button id="queue-remove-selected" type="button" hidden disabled>Remove</button>
+                            <button id="queue-confirm-remove" type="button" hidden>Confirm</button>
+                            <button id="queue-keep-selection" type="button" hidden>Keep</button>
+                            <button id="queue-cancel-selection" type="button" hidden>Cancel</button>
+                        </div>
+                        <button class="queue-close-btn" id="queue-close" type="button" title="Close queue" aria-label="Close queue">${ICONS.close}</button>
                     </div>
                 </div>
                 <div class="queue-now-playing" id="queue-now-playing" role="status" hidden>
@@ -4921,12 +5677,12 @@
                 <div class="queue-list" id="queue-list" role="list" aria-label="Queue"></div>
                 <div class="queue-source-note" id="queue-source-note"></div>
             </div>
-            <!-- Top bar: queue button always; next-song text is optional -->
+            <!-- Top bar: close button always; next-song text is optional -->
             <div class="upcoming-bar" id="upcoming-bar">
                 <span class="upcoming-label"><span class="upcoming-dot"></span>Next</span>
                 <span class="upcoming-text" id="upcoming-text"><span id="upcoming-title" class="upcoming-title"></span><span id="upcoming-artist" class="upcoming-artist"></span></span>
-                <button class="queue-btn shrink-btn" id="btn-shrink" title="Shrink">${ICONS.shrink}</button>
-                <button class="queue-btn" id="btn-queue" title="Queue">${ICONS.queue}</button>
+                <button class="topbar-action-btn shrink-btn" id="btn-shrink" title="Shrink">${ICONS.shrink}</button>
+                <button class="topbar-action-btn topbar-close-btn" id="btn-close-top" title="Close Mini Player" aria-label="Close Mini Player">${ICONS.close}</button>
             </div>
             <div class="miniplayer-card" id="miniplayer-card">
                 <!-- Standard Mode Header -->
@@ -4946,12 +5702,9 @@
                         <div class="lyrics-action-group">
                             <span class="lyrics-source" id="lyrics-source"></span>
                             <button class="lyrics-text-mode" id="btn-lyrics-text-mode" title="Lyrics text: Original (click to cycle)" aria-label="Lyrics text: Original (click to cycle)">Original</button>
-                            <button class="icon-btn" id="btn-lyrics" title="Show SpicyLyrics" aria-label="Show SpicyLyrics" aria-pressed="false">
-                                ${ICONS.lyrics}
-                            </button>
                         </div>
-                        <button class="icon-btn" id="btn-close" title="Close Mini Player">
-                            ${ICONS.close}
+                        <button class="icon-btn queue-toggle-btn" id="btn-queue" title="Queue" aria-label="Show queue" aria-expanded="false" aria-controls="queue-panel">
+                            ${ICONS.queue}
                         </button>
                     </div>
                 </div>
@@ -5009,8 +5762,11 @@
                                     ${ICONS.lyrics}
                                 </button>
                             </div>
-                            <button class="icon-btn" id="btn-close-compact" title="Close Mini Player">
-                                ${ICONS.close}
+                            <button class="icon-btn queue-toggle-btn" id="btn-queue-compact" title="Queue" aria-label="Show queue" aria-expanded="false" aria-controls="queue-panel">
+                                ${ICONS.queue}
+                            </button>
+                            <button class="icon-btn dynamic-mini-expand-btn" id="btn-expand-standard" title="Expand to Standard size" aria-label="Expand to Standard size">
+                                ${ICONS.maximize2}
                             </button>
                         </div>
                     </div>
@@ -5027,7 +5783,11 @@
 
                 <!-- Standard Mode Bottom Controls -->
                 <div class="controls-section" id="controls-section">
-                    <div class="controls-spacer"></div>
+                    <div class="controls-spacer">
+                        <button class="icon-btn" id="btn-lyrics" title="Show SpicyLyrics" aria-label="Show SpicyLyrics" aria-pressed="false">
+                            ${ICONS.lyrics}
+                        </button>
+                    </div>
 
                     <div class="playback-controls">
                         <button class="icon-btn" id="btn-shuffle" title="Enable Shuffle">
@@ -5207,12 +5967,14 @@
 
         // Shrink button (large window): back to the biggest mode that's enabled in settings
         listenPiP(doc.getElementById("btn-shrink"), "click", shrinkToBiggestMode);
+        listenPiP(doc.getElementById("btn-expand-standard"), "click", expandToStandardSize);
 
-        // Queue button in the top bar: show/hide the queue list.
-        const queueButton = doc.getElementById("btn-queue");
-        listenPiP(queueButton, "click", () => {
+        // Queue buttons in the former close-button locations: show/hide the queue list.
+        const queueButtons = Array.from(doc.querySelectorAll(".queue-toggle-btn"));
+        const setQueueOpen = open => {
             if (queueBulkRemoving) return;
-            queueOpen = !queueOpen;
+            if (queueOpen === open) return;
+            queueOpen = open;
             if (!queueOpen) {
                 queueSelectionMode = false;
                 queueSelectedItems.clear();
@@ -5220,7 +5982,9 @@
             }
             applyQueueLayout();
             if (queueOpen) safeSetTimeout(() => syncPlayerState(["queue"]), 50);
-        });
+        };
+        queueButtons.forEach(button => listenPiP(button, "click", () => setQueueOpen(!queueOpen)));
+        listenPiP(doc.getElementById("queue-close"), "click", () => setQueueOpen(false));
         listenPiP(doc.getElementById("queue-select-items"), "click", beginQueueSelectionMode);
         listenPiP(doc.getElementById("queue-remove-selected"), "click", requestBulkQueueRemoval);
         listenPiP(doc.getElementById("queue-confirm-remove"), "click", removeSelectedQueueItems);
@@ -5229,11 +5993,13 @@
             updateQueueSelectionToolbar(doc);
         });
         listenPiP(doc.getElementById("queue-cancel-selection"), "click", endQueueSelectionMode);
-        listenPiP(queueButton, "keydown", (e) => {
-            if (e.code === "Space" || e.key === " ") e.preventDefault();
-        });
-        listenPiP(queueButton, "keyup", (e) => {
-            if (e.code === "Space" || e.key === " ") e.preventDefault();
+        queueButtons.forEach(button => {
+            listenPiP(button, "keydown", (e) => {
+                if (e.code === "Space" || e.key === " ") e.preventDefault();
+            });
+            listenPiP(button, "keyup", (e) => {
+                if (e.code === "Space" || e.key === " ") e.preventDefault();
+            });
         });
         listenPiP(doc.getElementById("queue-panel"), "contextmenu", (e) => {
             e.preventDefault();
@@ -5286,8 +6052,7 @@
         listenPiP(doc.getElementById("queue-list"), "scroll", closeQueueMenu);
 
         // Close Buttons
-        listenPiP(doc.getElementById("btn-close"), "click", () => closeMiniPlayer());
-        listenPiP(doc.getElementById("btn-close-compact"), "click", () => closeMiniPlayer());
+        listenPiP(doc.getElementById("btn-close-top"), "click", () => closeMiniPlayer());
 
         // Play / Pause
         const handlePlayPause = () => Spicetify.Player.togglePlay();
@@ -5304,10 +6069,7 @@
 
         // Shuffle & Repeat (standard + compact buttons)
         ["btn-shuffle", "btn-shuffle-compact"].forEach(id => {
-            listenPiP(doc.getElementById(id), "click", () => {
-                Spicetify.Player.toggleShuffle();
-                safeSetTimeout(() => syncPlayerState(["shuffle"]), 100);
-            });
+            listenPiP(doc.getElementById(id), "click", togglePlayerShuffle);
         });
         ["btn-repeat", "btn-repeat-compact"].forEach(id => {
             listenPiP(doc.getElementById(id), "click", () => {
@@ -5433,7 +6195,7 @@
                     setVolumePopup(!isVolumePopupOpen());
                     return;
                 }
-                Spicetify.Player.toggleMute();
+                togglePlayerMute();
                 if (isVolumePopupOpen()) resetVolumePopupTimer();
                 safeSetTimeout(() => syncPlayerState(["volume"]), 100);
             });
@@ -5739,6 +6501,7 @@
         const coverEl = doc.getElementById("cover-img");
         const ambientBg = doc.getElementById("ambient-bg");
         const coverUrl = meta.cover || "";
+        updatePlayerStyleForTrack(coverUrl);
         if (coverEl && coverEl.dataset.src !== coverUrl) {
             coverEl.dataset.src = coverUrl;
             if (coverUrl) {
@@ -6254,6 +7017,10 @@
         ["btn-repeat", "btn-repeat-compact"].forEach(id => {
             const button = doc.getElementById(id);
             if (!button) return;
+            const wasRepeatOne = button.classList.contains("repeat-one");
+            if (isRepeatOne !== wasRepeatOne) {
+                button.innerHTML = isRepeatOne ? ICONS.repeatOne : ICONS.repeat;
+            }
             button.classList.toggle("active", isRepeat);
             button.classList.toggle("repeat-one", isRepeatOne);
             button.title = repeatTitle;
@@ -6520,6 +7287,8 @@
             console.warn("[MiniPlayer] Playbar injection error:", e);
         }
 
+        installNativePiPGuard();
+
         // 2b. Take over Spotify's and SpicyLyrics' "Open in Miniplayer" buttons before their handlers run.
         try {
             const takeoverStyle = document.createElement("style");
@@ -6527,16 +7296,19 @@
             takeoverStyle.textContent = `[data-mp-active="true"], [data-mp-active="true"] svg { color: #1ed760 !important; fill: #1ed760 !important; }`;
             document.head.appendChild(takeoverStyle);
 
-            document.addEventListener("click", (e) => {
+            const takeoverHandler = (e) => {
                 if (!settings.replaceNative) return;
                 const t = /** @type {any} */ (e.target);
                 const el = t && t.closest ? t.closest("button, [role='button']") : null;
-                if (!el || (!isNativeMiniplayerButton(el) && !isOpenMiniplayerButton(el))) return;
-                e.preventDefault();
+                if (!el) return;
+                if (!isNativeMiniplayerButton(el) && !isOpenMiniplayerButton(el)) return;
                 e.stopPropagation();
                 e.stopImmediatePropagation();
-                toggleMiniPlayer();
-            }, true);
+                if (e.type === "click" || e.type === "auxclick") e.preventDefault();
+                if (e.type === "click") toggleMiniPlayer();
+            };
+            ["pointerdown", "mousedown", "pointerup", "mouseup", "click", "auxclick"]
+                .forEach(type => window.addEventListener(type, takeoverHandler, true));
         } catch (e) {
             console.warn("[MiniPlayer] Could not set up the native button takeover:", e);
         }
