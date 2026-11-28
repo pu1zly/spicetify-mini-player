@@ -50,6 +50,7 @@
     let queueDragDisposers = [];
     let queueDragState = null;
     let queueRenderGeneration = 0;
+    let progressElements = null;
     // Re-evaluates which mini player launcher the playback bar shows (assigned in registerButtons)
     let syncPlaybarButtons = () => {};
     let pipResources = null;
@@ -371,6 +372,7 @@
         const resources = pipResources;
         pipResources = null;
         resources?.cleanup();
+        progressElements = null;
         rafId = null;
         progressTimerId = null;
         isUserSeeking = false;
@@ -426,11 +428,11 @@
         mono:     { label: "Mono", bg: "#0a0a0a", surface: "#1f1f1f", text: "#ffffff", subdued: "#a3a3a3", muted: "#737373", border: "#525252", accent: "#ffffff", fg: "255, 255, 255", onText: "#000000" }
     };
     const PLAYER_STYLES = { classic: "Classic" };
-    const KNOWN_PLAYER_STYLE_IDS = new Set(["classic", "aero", "artwork"]);
     const installedPlayerStyles = new Map();
     const playerStyleRegistry = Spicetify.MiniPlayerThemes || (Spicetify.MiniPlayerThemes = { pending: [] });
     let styleAccent = "";
     let currentPlayerStyleId = "classic";
+    let activePlayerStyleVariables = new Set();
     const HEX_COLOR = /^#[0-9a-f]{6}$/i;
 
     function hexToRgb(hex) {
@@ -515,15 +517,54 @@
             label: definition.label.trim(),
             className: `style-${definition.id}`,
             css: definition.css,
-            accentFromArtwork: definition.accentFromArtwork === true,
-            usesArtworkBackground: definition.usesArtworkBackground === true,
-            artworkBackgroundBlurScale: Number.isFinite(definition.artworkBackgroundBlurScale)
-                ? Math.max(0, definition.artworkBackgroundBlurScale)
-                : 0,
+            previewCss: typeof definition.previewCss === "string" ? definition.previewCss : "",
+            getVariables: typeof definition.getVariables === "function" ? definition.getVariables : null,
+            sharedControls: definition.sharedControls && typeof definition.sharedControls === "object"
+                ? definition.sharedControls
+                : {},
+            settings: definition.settings && typeof definition.settings === "object"
+                ? {
+                    title: typeof definition.settings.title === "string" ? definition.settings.title : "",
+                    controls: Array.isArray(definition.settings.controls)
+                        ? definition.settings.controls.filter(control =>
+                            control && control.type === "range"
+                            && typeof control.key === "string"
+                            && /^[a-z][a-zA-Z0-9]*$/.test(control.key)
+                            && typeof control.label === "string"
+                            && Number.isFinite(control.min)
+                            && Number.isFinite(control.max)
+                            && control.max > control.min
+                            && Number.isFinite(control.step)
+                            && control.step > 0
+                        )
+                        : []
+                }
+                : null,
             onTrackChange: typeof definition.onTrackChange === "function" ? definition.onTrackChange : null
         };
         installedPlayerStyles.set(playerStyle.id, playerStyle);
         PLAYER_STYLES[playerStyle.id] = playerStyle.label;
+        if (Array.isArray(definition.legacyIds)) {
+            definition.legacyIds.forEach(legacyId => {
+                if (typeof legacyId === "string" && settings.style === legacyId) settings.style = playerStyle.id;
+            });
+        }
+        playerStyle.settings?.controls?.forEach(control => {
+            if (!control || typeof control.key !== "string" || control.type !== "range") return;
+            const fallback = Number.isFinite(control.defaultValue) ? control.defaultValue : control.min;
+            if (!Number.isFinite(settings[control.key])) settings[control.key] = fallback;
+            settings[control.key] = clampNum(settings[control.key], control.min, control.max, fallback);
+        });
+        if (playerStyle.previewCss) {
+            const previewStyleId = `miniplayer-style-preview-${playerStyle.id}`;
+            let previewStyle = document.getElementById(previewStyleId);
+            if (!previewStyle) {
+                previewStyle = document.createElement("style");
+                previewStyle.id = previewStyleId;
+                document.head.appendChild(previewStyle);
+            }
+            previewStyle.textContent = playerStyle.previewCss;
+        }
         if (isPiPWindowOpen()) {
             injectPlayerStyle(pipWindow.document, playerStyle);
             if (settings.style === playerStyle.id) {
@@ -537,12 +578,11 @@
     function resolveTheme() {
         const base = THEMES[settings.theme] || THEMES.spotify;
         const overridden = HEX_COLOR.test(settings.accentOverride);
-        const playerStyle = getActivePlayerStyle();
-        const artworkAccent = !!playerStyle?.accentFromArtwork && HEX_COLOR.test(styleAccent);
+        const contributedAccent = HEX_COLOR.test(styleAccent);
         const background = HEX_COLOR.test(settings.backgroundOverride)
             ? settings.backgroundOverride.toLowerCase()
             : base.bg;
-        const accent = (artworkAccent ? styleAccent : overridden ? settings.accentOverride : base.accent).toLowerCase();
+        const accent = (contributedAccent ? styleAccent : overridden ? settings.accentOverride : base.accent).toLowerCase();
         return {
             "--mp-bg": background,
             "--mp-bg-rgb": hexToRgb(background).join(", "),
@@ -558,7 +598,7 @@
             "--mp-accent": accent,
             "--mp-accent-rgb": hexToRgb(accent).join(", "),
             "--mp-accent-hover": mixHex(accent, "#ffffff", 0.14),
-            "--mp-accent-strong": !overridden && !artworkAccent && base.accentStrong
+            "--mp-accent-strong": !overridden && !contributedAccent && base.accentStrong
                 ? base.accentStrong
                 : mixHex(accent, "#000000", 0.07),
             "--mp-on-accent": luminance(accent) > 0.179 ? "#000000" : "#ffffff"
@@ -606,7 +646,6 @@
         volumeStep: 5,           // percent per scroll notch
         toggleShortcut: { code: "KeyM", key: "M", altKey: true, ctrlKey: false, shiftKey: false, metaKey: false },
         albumArtGradient: true,
-        artworkBackgroundBlur: 35, // percentage of the maximum artwork-background blur
         clickToOpen: true,       // click title/artist to open album/artist page
         dynamicResize: false,    // experimental: free window resizing, the layout adapts to the size
         showUpcoming: true,      // Show the next playback-queue item in the top bar
@@ -666,11 +705,21 @@
     }
 
     function cloneDefaultSettings() {
-        return {
+        const defaults = {
             ...DEFAULT_SETTINGS,
             toggleShortcut: { ...DEFAULT_SETTINGS.toggleShortcut },
             modes: { ...DEFAULT_SETTINGS.modes }
         };
+        installedPlayerStyles.forEach(playerStyle => {
+            playerStyle.settings?.controls?.forEach(control => {
+                if (control.type === "range") {
+                    defaults[control.key] = Number.isFinite(control.defaultValue)
+                        ? clampNum(control.defaultValue, control.min, control.max, control.min)
+                        : control.min;
+                }
+            });
+        });
+        return defaults;
     }
 
     function loadSettings() {
@@ -686,10 +735,8 @@
         s.idleDelay = clampNum(s.idleDelay, 200, 5000, DEFAULT_SETTINGS.idleDelay);
         s.seekStep = clampNum(s.seekStep, 1, 30, DEFAULT_SETTINGS.seekStep);
         s.volumeStep = clampNum(s.volumeStep, 1, 20, DEFAULT_SETTINGS.volumeStep);
-        s.artworkBackgroundBlur = clampNum(s.artworkBackgroundBlur, 0, 100, DEFAULT_SETTINGS.artworkBackgroundBlur);
         if (!Object.prototype.hasOwnProperty.call(THEMES, s.theme)) s.theme = DEFAULT_SETTINGS.theme;
-        if (s.style === "minimal") s.style = "aero";
-        if (!KNOWN_PLAYER_STYLE_IDS.has(s.style)) s.style = DEFAULT_SETTINGS.style;
+        if (typeof s.style !== "string" || !/^[a-z][a-z0-9-]*$/.test(s.style)) s.style = DEFAULT_SETTINGS.style;
         if (typeof s.backgroundOverride !== "string" || !HEX_COLOR.test(s.backgroundOverride)) s.backgroundOverride = "";
         if (typeof s.accentOverride !== "string" || !HEX_COLOR.test(s.accentOverride)) s.accentOverride = "";
         s.toggleShortcut = normalizeToggleShortcut(s.toggleShortcut);
@@ -837,6 +884,8 @@
     const FLUID_ART_MIN_HEIGHT = 290; // card height above which the big album-art layout kicks in
 
     // SVG Icons
+    const volumeIcon = paths => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+    const volumeSpeakerPath = `<path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/>`;
     const ICONS = {
         more: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><circle cx="2.5" cy="8" r="1.5"/><circle cx="8" cy="8" r="1.5"/><circle cx="13.5" cy="8" r="1.5"/></svg>`,
         queue: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M15 15H1v-1.5h14V15zm0-4.5H1V9h14v1.5zm-14-7A2.5 2.5 0 0 1 3.5 1h9a2.5 2.5 0 0 1 0 5h-9A2.5 2.5 0 0 1 1 3.5zm2.5-1a1 1 0 0 0 0 2h9a1 1 0 1 0 0-2h-9z"/></svg>`,
@@ -851,9 +900,9 @@
         shuffle: `<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.151.922a.75.75 0 1 0-1.06 1.06L13.109 3H11.16a3.75 3.75 0 0 0-2.873 1.34l-6.173 7.356A2.25 2.25 0 0 1 .39 12.5H0V14h.391a3.75 3.75 0 0 0 2.873-1.34l6.173-7.356a2.25 2.25 0 0 1 1.724-.804h1.947l-1.017 1.018a.75.75 0 0 0 1.06 1.06L15.98 3.75 13.15.922zM.391 3.5H0V2h.391c.9 0 1.745.405 2.308 1.077l1.724 2.056-.99.832L1.936 4.195A2.25 2.25 0 0 0 .39 3.5zm12.76 7.422a.75.75 0 0 1 1.06 1.06L11.39 14.805a.75.75 0 0 1-1.06-1.06l1.439-1.439h-1.61a3.75 3.75 0 0 1-2.872-1.34l-1.724-2.056.99-.832 1.498 1.787a2.25 2.25 0 0 0 1.724.805h1.948l-1.439-1.44z"/></svg>`,
         repeat: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>`,
         repeatOne: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/><path d="M11 10h1v4"/></svg>`,
-        volumeHigh: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/></svg>`,
-        volumeMedium: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/><path d="M16 9a5 5 0 0 1 0 6"/></svg>`,
-        volumeMute: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.7.7 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.7.7 0 0 0 11 19.298z"/><path d="m16.5 14.5 5-5"/><path d="m16.5 9.5 5 5"/></svg>`,
+        volumeHigh: volumeIcon(`${volumeSpeakerPath}<path d="M16 9a5 5 0 0 1 0 6"/><path d="M19.364 18.364a9 9 0 0 0 0-12.728"/>`),
+        volumeMedium: volumeIcon(`${volumeSpeakerPath}<path d="M16 9a5 5 0 0 1 0 6"/>`),
+        volumeMute: volumeIcon(`<path d="M11 4.702a.7.7 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.7.7 0 0 0 11 19.298z"/><path d="m16.5 14.5 5-5"/><path d="m16.5 9.5 5 5"/>`),
         compact: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M1.5 1h13A1.5 1.5 0 0 1 16 2.5v11a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 13.5v-11A1.5 1.5 0 0 1 1.5 1zm0 1.5a.5.5 0 0 0-.5.5v2h14V3a.5.5 0 0 0-.5-.5h-13zM15 6H1v7.5a.5.5 0 0 0 .5.5h13a.5.5 0 0 0 .5-.5V6z"/></svg>`,
         expand: `<svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M2.5 1A1.5 1.5 0 0 0 1 2.5v11A1.5 1.5 0 0 0 2.5 15h11a1.5 1.5 0 0 0 1.5-1.5v-11A1.5 1.5 0 0 0 13.5 1h-11zm0 1.5h11a.5.5 0 0 1 .5.5v11a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5z"/></svg>`,
         close: `<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8 2.146 2.854z"/></svg>`,
@@ -870,21 +919,28 @@
         updatePlaybarShortcutLabel();
         if (!isPiPWindowOpen()) return;
         const doc = pipWindow.document;
-        const playerStyle = getActivePlayerStyle();
         applyThemeVars(doc.documentElement);
         doc.documentElement.style.setProperty("--idle-opacity", String(settings.idleOpacity));
-        doc.documentElement.style.setProperty(
-            "--artwork-background-blur",
-            `${settings.artworkBackgroundBlur * (playerStyle?.artworkBackgroundBlurScale || 0)}px`
-        );
+        const activeStyleId = getActivePlayerStyleId();
+        const activePlayerStyle = installedPlayerStyles.get(activeStyleId) || null;
+        activePlayerStyleVariables.forEach(name => doc.documentElement.style.removeProperty(name));
+        activePlayerStyleVariables = new Set();
+        const styleVariables = activePlayerStyle?.getVariables?.(settings) || {};
+        Object.entries(styleVariables).forEach(([name, value]) => {
+            if (!/^--[a-z][a-z0-9-]*$/.test(name) || typeof value !== "string") return;
+            doc.documentElement.style.setProperty(name, value);
+            activePlayerStyleVariables.add(name);
+        });
         doc.body.classList.toggle("links-off", !settings.clickToOpen);
-        doc.body.classList.toggle("album-art-gradient-off", !settings.albumArtGradient);
+        doc.body.classList.toggle(
+            "album-art-gradient-off",
+            !settings.albumArtGradient || activePlayerStyle?.sharedControls?.albumArtGradient === false
+        );
         doc.body.classList.toggle("custom-background", !!customBackgroundData);
         const customBackground = doc.getElementById("custom-bg");
         if (customBackground) {
             customBackground.style.backgroundImage = customBackgroundData ? `url("${customBackgroundData}")` : "none";
         }
-        const activeStyleId = getActivePlayerStyleId();
         installedPlayerStyles.forEach(style => {
             doc.body.classList.toggle(style.className, style.id === activeStyleId);
         });
@@ -998,6 +1054,7 @@
             .mp-section:first-child { margin-top: 4px; }
             .mp-group { padding: 2px 16px; border-radius: 8px; background: rgba(255, 255, 255, 0.04); }
             .mp-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 12px 0; }
+            .mp-row.disabled { opacity: 0.45; }
             .mp-row + .mp-row { border-top: 1px solid rgba(255, 255, 255, 0.06); }
             .mp-text { min-width: 0; flex: 1; }
             .mp-label { font-size: 14px; font-weight: 500; color: #fff; }
@@ -1027,6 +1084,11 @@
             .mp-range input:hover::-webkit-slider-runnable-track {
                 background: linear-gradient(to right, #1ed760 var(--stop), rgba(255, 255, 255, 0.3) var(--stop));
             }
+            .mp-range input:disabled { cursor: not-allowed; }
+            .mp-range input:disabled::-webkit-slider-runnable-track,
+            .mp-range input:disabled:hover::-webkit-slider-runnable-track {
+                background: linear-gradient(to right, rgba(255, 255, 255, 0.22) var(--stop), rgba(255, 255, 255, 0.1) var(--stop));
+            }
             .mp-range input::-webkit-slider-thumb {
                 -webkit-appearance: none; appearance: none;
                 width: var(--thumb); height: var(--thumb); border-radius: 50%;
@@ -1036,6 +1098,7 @@
             }
             .mp-range input:hover::-webkit-slider-thumb,
             .mp-range input:active::-webkit-slider-thumb { opacity: 1; }
+            .mp-range input:disabled::-webkit-slider-thumb { opacity: 0; }
             .mp-value { min-width: 38px; text-align: right; font-size: 12px; color: #a7a7a7; font-variant-numeric: tabular-nums; }
             .mp-inline { display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
             .mp-shortcut-control { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
@@ -1073,11 +1136,6 @@
             .mp-style-preview-lines span { height: 3px; border-radius: 2px; background: rgba(255, 255, 255, 0.78); }
             .mp-style-preview-lines span:last-child { width: 60%; background: rgba(255, 255, 255, 0.35); }
             .mp-style-preview-control { flex: 0 0 10px; width: 10px; height: 10px; border-radius: 50%; background: #fff; }
-            .mp-style-preview.aero { height: 42px; border: 1px solid rgba(190, 245, 255, 0.62); border-radius: 11px; background: radial-gradient(ellipse at 18% 0%, rgba(111, 240, 213, 0.62), transparent 58%), linear-gradient(145deg, rgba(255, 255, 255, 0.28), rgba(40, 129, 157, 0.48)); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 2px 5px rgba(0, 0, 0, 0.22); }
-            .mp-style-preview.aero .mp-style-preview-art { border-radius: 7px; background: linear-gradient(145deg, #c4f4ce, #52b9cf 55%, #66a8da); box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.7), 0 1px 3px rgba(0, 0, 0, 0.3); }
-            .mp-style-preview.aero .mp-style-preview-control { background: linear-gradient(145deg, #d6ffe6, #72dfd1); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.75), 0 1px 3px rgba(4, 75, 96, 0.55); }
-            .mp-style-preview.artwork { height: 48px; gap: 5px; padding: 4px; }
-            .mp-style-preview.artwork .mp-style-preview-art { flex-basis: 38px; width: 38px; height: 38px; border-radius: 5px; }
             .mp-color { width: 38px; height: 26px; padding: 0; border: 1px solid rgba(255, 255, 255, 0.3); border-radius: 6px; background: transparent; cursor: pointer; }
             .mp-color:disabled { opacity: 0.4; cursor: default; }
             .mp-color::-webkit-color-swatch-wrapper { padding: 2px; }
@@ -1090,6 +1148,8 @@
         const scroll = h("div", "mp-scroll");
         root.appendChild(scroll);
         let group = scroll;
+        const styleSettingsContainer = h("div", "mp-style-settings");
+        let renderStyleSettings = () => {};
 
         const update = (key, value) => {
             settings[key] = value;
@@ -1109,6 +1169,7 @@
             r.appendChild(left);
             r.appendChild(control);
             group.appendChild(r);
+            return r;
         };
         const rowStack = (label, desc, control) => {
             const r = h("div", "mp-row stack");
@@ -1130,13 +1191,14 @@
             return wrap;
         };
         // toUi/fromUi convert between the stored value and the slider's own units
-        const slider = (key, min, max, step, toUi, fromUi, fmt) => {
+        const slider = (key, min, max, step, toUi, fromUi, fmt, ariaLabel = "") => {
             const wrap = h("div", "mp-range");
             const input = document.createElement("input");
             input.type = "range";
             input.min = String(min);
             input.max = String(max);
             input.step = String(step);
+            if (ariaLabel) input.setAttribute("aria-label", ariaLabel);
             // --p drives the slider's fill
             const setFill = () => input.style.setProperty("--p", String((parseFloat(input.value) - min) / (max - min)));
             input.value = String(toUi(settings[key]));
@@ -1151,6 +1213,32 @@
             wrap.appendChild(input);
             wrap.appendChild(out);
             return wrap;
+        };
+        renderStyleSettings = () => {
+            styleSettingsContainer.replaceChildren();
+            const contribution = getActivePlayerStyle()?.settings;
+            if (!contribution?.controls.length) return;
+
+            styleSettingsContainer.appendChild(h(
+                "div",
+                "mp-section",
+                contribution.title || `${getActivePlayerStyle()?.label || "Player style"} settings`
+            ));
+            const previousGroup = group;
+            group = h("div", "mp-group");
+            styleSettingsContainer.appendChild(group);
+            contribution.controls.forEach(control => {
+                if (!Number.isFinite(settings[control.key])) {
+                    settings[control.key] = Number.isFinite(control.defaultValue) ? control.defaultValue : control.min;
+                }
+                const format = control.format === "percent" ? value => `${value}%` : value => String(value);
+                row(
+                    control.label,
+                    control.description || "",
+                    slider(control.key, control.min, control.max, control.step, value => value, value => value, format, control.label)
+                );
+            });
+            group = previousGroup;
         };
 
         const shortcutControl = () => {
@@ -1215,9 +1303,10 @@
 
         let syncBackgroundControl = () => {};
         let syncAccentControl = () => {};
-        let syncArtworkControls = () => {};
+        let syncSharedControls = () => {};
         let albumArtGradientInput = null;
-        let artworkBackgroundBlurInput = null;
+        let albumArtGradientRow = null;
+        let albumArtGradientDescription = null;
         const stylePicker = () => {
             const grid = h("div", "mp-styles");
             const buttons = new Map();
@@ -1244,7 +1333,8 @@
                         element.classList.toggle("on", selected);
                         element.setAttribute("aria-pressed", String(selected));
                     });
-                    syncArtworkControls();
+                    syncSharedControls();
+                    renderStyleSettings();
                 });
                 buttons.set(id, button);
                 grid.appendChild(button);
@@ -1268,7 +1358,6 @@
                 tile.appendChild(h("span", "mp-theme-name", theme.label));
                 tile.addEventListener("click", () => {
                     settings.theme = id;
-                    if (!getActivePlayerStyle()?.accentFromArtwork) settings.accentOverride = "";
                     saveSettings();
                     applySettings();
                     syncBackgroundControl();
@@ -1277,7 +1366,7 @@
                         element.classList.toggle("on", selected);
                         element.setAttribute("aria-pressed", String(selected));
                     });
-                    syncArtworkControls();
+                    syncSharedControls();
                 });
                 tiles.set(id, tile);
                 grid.appendChild(tile);
@@ -1328,9 +1417,9 @@
             reset.type = "button";
             syncAccentControl = () => {
                 input.value = resolveTheme()["--mp-accent"];
-                const artworkStyle = !!getActivePlayerStyle()?.accentFromArtwork;
-                input.disabled = artworkStyle;
-                reset.disabled = artworkStyle || !settings.accentOverride;
+                const disabled = getActivePlayerStyle()?.sharedControls?.accent === false;
+                input.disabled = disabled;
+                reset.disabled = disabled || !settings.accentOverride;
             };
             input.addEventListener("input", () => {
                 settings.accentOverride = input.value;
@@ -1365,21 +1454,27 @@
             const status = h("span", "mp-background-status", customBackgroundData ? "Custom image applied." : "No image selected.");
             status.setAttribute("aria-live", "polite");
             let preparing = false;
-            syncArtworkControls = () => {
-                const artworkStyle = !!getActivePlayerStyle()?.usesArtworkBackground;
+            syncSharedControls = () => {
+                const sharedControls = getActivePlayerStyle()?.sharedControls || {};
+                const customBackgroundDisabled = sharedControls.customBackground === false;
                 syncAccentControl();
-                input.disabled = artworkStyle || preparing;
-                choose.disabled = artworkStyle || preparing;
-                remove.disabled = artworkStyle || preparing || !customBackgroundData;
-                if (albumArtGradientInput) albumArtGradientInput.disabled = artworkStyle;
-                if (artworkBackgroundBlurInput) artworkBackgroundBlurInput.disabled = !artworkStyle;
-                status.textContent = artworkStyle
-                    ? customBackgroundData
-                        ? `${getActivePlayerStyle()?.label || "This style"} uses album art. Your saved image is kept for other styles.`
-                        : `${getActivePlayerStyle()?.label || "This style"} uses album art. Custom backgrounds are disabled.`
-                    : customBackgroundData
-                        ? "Custom image applied."
-                        : "No image selected.";
+                input.disabled = customBackgroundDisabled || preparing;
+                choose.disabled = customBackgroundDisabled || preparing;
+                remove.disabled = customBackgroundDisabled || preparing || !customBackgroundData;
+                const albumArtGradientDisabled = sharedControls.albumArtGradient === false;
+                if (albumArtGradientInput) albumArtGradientInput.disabled = albumArtGradientDisabled;
+                if (albumArtGradientRow) albumArtGradientRow.classList.toggle("disabled", albumArtGradientDisabled);
+                if (albumArtGradientDescription) {
+                    albumArtGradientDescription.textContent = albumArtGradientDisabled
+                        ? sharedControls.albumArtGradientMessage || "Not available with the selected player style."
+                        : "Show a blurred album-art glow behind the player.";
+                }
+                if (customBackgroundDisabled) {
+                    status.textContent = sharedControls.customBackgroundMessage
+                        || `${getActivePlayerStyle()?.label || "This style"} doesn't use custom backgrounds.`;
+                } else {
+                    status.textContent = customBackgroundData ? "Custom image applied." : "No image selected.";
+                }
             };
 
             choose.addEventListener("click", () => input.click());
@@ -1398,17 +1493,14 @@
                     localStorage.setItem(CUSTOM_BACKGROUND_KEY, data);
                     customBackgroundData = data;
                     applySettings();
-                    syncArtworkControls();
+                    syncSharedControls();
                 } catch (err) {
                     console.warn("[MiniPlayer] Could not save the custom background:", err);
                     status.textContent = err.message || "The image could not be saved.";
                     Spicetify.showNotification(status.textContent, true);
                 } finally {
                     preparing = false;
-                    const artworkStyle = !!getActivePlayerStyle()?.usesArtworkBackground;
-                    input.disabled = artworkStyle;
-                    choose.disabled = artworkStyle;
-                    remove.disabled = artworkStyle || !customBackgroundData;
+                    syncSharedControls();
                 }
             });
             remove.addEventListener("click", () => {
@@ -1416,7 +1508,7 @@
                     localStorage.removeItem(CUSTOM_BACKGROUND_KEY);
                     customBackgroundData = "";
                     applySettings();
-                    syncArtworkControls();
+                    syncSharedControls();
                 } catch (err) {
                     console.warn("[MiniPlayer] Could not remove the custom background:", err);
                     status.textContent = "Couldn't remove the saved image.";
@@ -1505,23 +1597,22 @@
 
         section("Appearance");
         rowStack("Theme", "Choose a color palette for the mini player.", themePicker());
-        rowStack("Player style", "Choose a layout and visual treatment; Skeuomorph adapts to your selected colors.", stylePicker());
+        rowStack("Player style", "Choose a visual style for the mini player.", stylePicker());
         row("Main color", "Override the theme's main player background.", backgroundControl());
-        row("Accent color", "Set a custom accent. Adaptive favors bright, saturated album-art colors and keeps this color for other styles.", accentControl());
+        row("Accent color", "Set a custom accent color for the player.", accentControl());
         const albumArtGradientControl = toggle("albumArtGradient");
         albumArtGradientInput = albumArtGradientControl.querySelector("input");
-        row("Album art gradient", "Show a blurred album-art glow. Adaptive uses a clear album-art background instead.",
-            albumArtGradientControl);
-        const artworkBackgroundBlurControl = slider(
-            "artworkBackgroundBlur", 0, 100, 5,
-            v => v, v => v, v => `${v}%`
+        albumArtGradientRow = row(
+            "Album art gradient",
+            "Show a blurred album-art glow behind the player.",
+            albumArtGradientControl
         );
-        artworkBackgroundBlurInput = artworkBackgroundBlurControl.querySelector("input");
-        row("Adaptive background blur", "Set the album-art background blur. 0% is sharp; 100% is strongest.",
-            artworkBackgroundBlurControl);
-        rowStack("Custom background image", "Custom images appear below the top bar. Adaptive uses current cover art instead.",
+        albumArtGradientDescription = albumArtGradientRow.querySelector(".mp-desc");
+        rowStack("Custom background image", "Use a local image below the top bar.",
             customBackgroundControl());
-        syncArtworkControls();
+        syncSharedControls();
+        scroll.appendChild(styleSettingsContainer);
+        renderStyleSettings();
 
         section("Experimental");
         row("Dynamic resizing",
@@ -3719,6 +3810,10 @@
 
             // Inject DOM
             pipWindow.document.body.innerHTML = getMiniPlayerHTML();
+            progressElements = {
+                timeCurrent: pipWindow.document.getElementById("time-current"),
+                slider: pipWindow.document.getElementById("progress-slider")
+            };
             applySettings();
 
             // Set Initial State
@@ -5526,7 +5621,6 @@
             }
             body.fluid.slim .topbar-close-btn { pointer-events: auto; }
             body.fluid.slim .upcoming-bar > :not(.topbar-close-btn) { display: none; }
-            body.fluid.slim .topbar-close-btn { pointer-events: auto; }
             .dynamic-mini-expand-btn { display: none !important; }
             body.fluid.slim.mini-mode .upcoming-bar { display: none; }
             body.fluid.slim.mini-mode .topbar-close-btn,
@@ -7061,13 +7155,12 @@
 
     function renderProgressUI() {
         if (!isPiPWindowOpen() || isUserSeeking) return;
-        const doc = pipWindow.document;
 
         const currentMs = playerState.progress || 0;
         const durationMs = playerState.duration || 0;
 
-        const timeCurrent = doc.getElementById("time-current");
-        const slider = doc.getElementById("progress-slider");
+        const timeCurrent = progressElements?.timeCurrent;
+        const slider = progressElements?.slider;
 
         if (timeCurrent) {
             const formatted = formatTime(currentMs);

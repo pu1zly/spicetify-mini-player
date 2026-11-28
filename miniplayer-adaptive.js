@@ -157,9 +157,33 @@
     const definition = {
         id: "artwork",
         label: "Adaptive",
-        accentFromArtwork: true,
-        usesArtworkBackground: true,
-        artworkBackgroundBlurScale: 0.4,
+        sharedControls: {
+            accent: false,
+            albumArtGradient: false,
+            customBackground: false,
+            customBackgroundMessage: "Adaptive uses the current cover as its background. Your saved custom image is kept for other styles."
+        },
+        getVariables: settings => ({
+            "--artwork-background-blur": `${settings.artworkBackgroundBlur * 0.4}px`
+        }),
+        settings: {
+            title: "Adaptive settings",
+            controls: [{
+                type: "range",
+                key: "artworkBackgroundBlur",
+                defaultValue: 35,
+                min: 0,
+                max: 100,
+                step: 5,
+                format: "percent",
+                label: "Background blur",
+                description: "Set the cover-art background blur. 0% is sharp; 100% is strongest."
+            }]
+        },
+        previewCss: `
+            .mp-style-preview.artwork { height: 48px; gap: 5px; padding: 4px; }
+            .mp-style-preview.artwork .mp-style-preview-art { flex-basis: 38px; width: 38px; height: 38px; border-radius: 5px; }
+        `,
         onTrackChange: updateAccent,
         css: `
             body.style-artwork .upcoming-bar {

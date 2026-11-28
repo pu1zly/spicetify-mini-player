@@ -6,6 +6,29 @@
     const definition = {
         id: "aero",
         label: "Skeuomorph",
+        legacyIds: ["minimal"],
+        sharedControls: {
+            albumArtGradient: false,
+            albumArtGradientMessage: "Skeuomorph uses metallic styling instead of an album-art glow."
+        },
+        previewCss: `
+            .mp-style-preview.aero {
+                height: 42px;
+                border: 1px solid rgba(190, 245, 255, 0.62);
+                border-radius: 11px;
+                background: radial-gradient(ellipse at 18% 0%, rgba(111, 240, 213, 0.62), transparent 58%), linear-gradient(145deg, rgba(255, 255, 255, 0.28), rgba(40, 129, 157, 0.48));
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), 0 2px 5px rgba(0, 0, 0, 0.22);
+            }
+            .mp-style-preview.aero .mp-style-preview-art {
+                border-radius: 7px;
+                background: linear-gradient(145deg, #c4f4ce, #52b9cf 55%, #66a8da);
+                box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.7), 0 1px 3px rgba(0, 0, 0, 0.3);
+            }
+            .mp-style-preview.aero .mp-style-preview-control {
+                background: linear-gradient(145deg, #d6ffe6, #72dfd1);
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.75), 0 1px 3px rgba(4, 75, 96, 0.55);
+            }
+        `,
         css: `
             @media (min-width: 690px) and (min-height: 420px) {
                 body.style-aero.podcast-video-active .miniplayer-card {
@@ -166,11 +189,11 @@
             body.style-aero .progress-slider::-webkit-slider-runnable-track {
                 background:
                     linear-gradient(180deg, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0.08) 52%, rgba(0, 0, 0, 0.24)),
-                    linear-gradient(to right, #1db954 var(--stop), rgba(255, 255, 255, 0.22) var(--stop));
+                    linear-gradient(to right, color-mix(in srgb, var(--mp-accent) 72%, white) var(--stop), rgba(255, 255, 255, 0.22) var(--stop));
                 box-shadow:
                     inset 0 1px 0 rgba(255, 255, 255, 0.5),
                     inset 0 -1px 0 rgba(0, 0, 0, 0.5),
-                    0 0 4px rgba(29, 185, 84, 0.34);
+                    0 0 5px rgba(var(--mp-accent-rgb), 0.42);
             }
             body.style-aero .progress-slider::-webkit-slider-thumb {
                 box-sizing: border-box;
@@ -304,8 +327,56 @@
                 background: linear-gradient(145deg, var(--mp-accent-hover), var(--mp-accent));
             }
             body.style-aero .upcoming-bar {
-                background: linear-gradient(180deg, rgba(var(--mp-fg-rgb), 0.12), rgba(var(--mp-accent-rgb), 0.07));
-                border-bottom-color: transparent;
+                background:
+                    linear-gradient(180deg, rgba(255, 255, 255, 0.38), rgba(255, 255, 255, 0.04) 34%, rgba(0, 0, 0, 0.05)),
+                    linear-gradient(110deg, #e1e4e6 0%, #aeb4b9 34%, #d0d4d7 65%, #a4abb1 100%);
+                border-bottom-color: rgba(42, 48, 53, 0.72);
+                box-shadow:
+                    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+                    inset 0 -1px 0 rgba(38, 44, 49, 0.48),
+                    0 2px 4px rgba(0, 0, 0, 0.24);
+            }
+            body.style-aero .upcoming-label {
+                color: #155c2b;
+            }
+            body.style-aero .upcoming-dot {
+                background: #187438;
+                box-shadow: 0 0 4px rgba(24, 116, 56, 0.7);
+            }
+            body.style-aero .upcoming-title {
+                color: #20262b;
+            }
+            body.style-aero .upcoming-artist {
+                color: #343b41;
+            }
+            body.style-aero .upcoming-bar.empty .upcoming-title {
+                color: #4c545a;
+            }
+            body.style-aero .upcoming-bar .topbar-action-btn {
+                align-items: center;
+                justify-content: center;
+                border: 1px solid #737b82;
+                border-radius: 50%;
+                background: linear-gradient(145deg, #e1e4e6, #a4abb1 54%, #858d94);
+                color: #30373d;
+                box-shadow:
+                    inset 0 1px 0 rgba(255, 255, 255, 0.92),
+                    inset 0 -1px 1px rgba(50, 57, 63, 0.38),
+                    0 1px 2px rgba(35, 40, 45, 0.38);
+            }
+            body.style-aero .upcoming-bar .topbar-action-btn svg {
+                display: block;
+                flex-shrink: 0;
+                margin: 0;
+            }
+            body.style-aero .upcoming-bar .topbar-action-btn:hover {
+                background: linear-gradient(145deg, #f1f3f4, #bac0c5 54%, #969ea4);
+                color: #171c20;
+            }
+            body.style-aero .upcoming-bar .topbar-action-btn:active {
+                background: linear-gradient(165deg, #7d858c, #a1a8ae);
+                box-shadow: inset 0 2px 3px rgba(35, 40, 45, 0.42);
+                transform: translateY(1px);
             }
             @media (prefers-reduced-motion: reduce) {
                 body.style-aero button {
